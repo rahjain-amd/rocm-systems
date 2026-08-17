@@ -56,36 +56,12 @@
 namespace rocr {
 namespace hotswap {
 
-namespace {
-
-// GPU masquerading: allow the reported gfx target / ASIC revision that feeds
-// the hotswap rewrite decision to be overridden via environment variables. This
-// lets the B0->A0 rewrite path (and its host-side load/rewrite cost) be
-// exercised on hardware that does not actually report gfx1250 A0 -- e.g. for
-// host-side profiling on a B0 box or an emulation backend. It only affects the
-// hotswap decision; nothing else in the runtime observes the faked values.
-void ApplyMasqueradeOverrides(AgentGfxRevision& revision) {
-  if (os::IsEnvVarSet("HSA_HOTSWAP_FORCE_GFX")) {
-    std::string forced = os::GetEnvVar("HSA_HOTSWAP_FORCE_GFX");
-    if (!forced.empty()) {
-      revision.gfx_target = forced;
-    }
-  }
-
-  if (os::IsEnvVarSet("HSA_HOTSWAP_FORCE_ASIC_REVISION")) {
-    std::string forced = os::GetEnvVar("HSA_HOTSWAP_FORCE_ASIC_REVISION");
-    if (!forced.empty()) {
-      char* end = nullptr;
-      const unsigned long parsed = std::strtoul(forced.c_str(), &end, 10);
-      if (end != forced.c_str()) {
-        revision.asic_revision = static_cast<uint32_t>(parsed);
-        revision.has_asic_revision = true;
-      }
-    }
-  }
-}
-
-}  // namespace
+// GPU masquerading now lives at the agent-identity layer (GpuAgent ctor in
+// amd_gpu_agent.cpp), driven by HSA_FORCE_GFX / HSA_FORCE_ASIC_REVISION. Because
+// the agent already REPORTS the masqueraded gfx target / ISA / ASIC revision
+// through the public HSA APIs, the queries below observe the forced values for
+// free -- there is a single source of truth and hotswap no longer applies its
+// own override.
 
 std::string GetAgentIsaName(hsa_agent_t agent) {
   std::string name;
@@ -169,7 +145,8 @@ AgentGfxRevision GetAgentGfxRevision(hsa_agent_t agent) {
     revision.has_asic_revision = true;
   }
 
-  ApplyMasqueradeOverrides(revision);
+  // No masquerade override here: gfx_target and asic_revision above are read
+  // from the agent's already-masqueraded reported identity (see amd_gpu_agent).
 
   {
     std::scoped_lock lock(g_agent_gfx_revision_cache_mutex);

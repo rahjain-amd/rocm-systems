@@ -361,6 +361,29 @@ class Flag {
     var = os::GetEnvVar("HSA_SDMA_MULTICAST");
     sdma_multicast_ = (var == "0") ? SDMA_DISABLE : ((var == "1") ? SDMA_ENABLE : SDMA_DEFAULT);
 
+    // General GPU masquerade override (IDENTITY ONLY). HSA_FORCE_GFX forces the
+    // gfx target / ISA name / gcnArch that every GPU agent REPORTS to the whole
+    // runtime and to applications (rocminfo, hsa_agent_get_info(ISA), hsa_isa_*,
+    // HIP gcnArchName, and code-object load compatibility). It is decoupled from
+    // hotswap: it takes effect standalone and also feeds the hotswap decision.
+    // HSA_FORCE_ASIC_REVISION likewise forces the reported ASIC stepping.
+    //
+    // This only changes REPORTED identity -- real device plumbing (queues,
+    // doorbell, memory, KFD node) always uses the physical ISA.
+    force_gfx_ = os::GetEnvVar("HSA_FORCE_GFX");
+
+    std::string force_asic = os::GetEnvVar("HSA_FORCE_ASIC_REVISION");
+    force_asic_revision_set_ = false;
+    force_asic_revision_ = 0;
+    if (!force_asic.empty()) {
+      char* end = nullptr;
+      const unsigned long parsed = strtoul(force_asic.c_str(), &end, 10);
+      if (end != force_asic.c_str()) {
+        force_asic_revision_ = static_cast<uint32_t>(parsed);
+        force_asic_revision_set_ = true;
+      }
+    }
+
   }
 
   void parse_masks(uint32_t maxGpu, uint32_t maxCU) {
@@ -507,6 +530,15 @@ class Flag {
 
   SDMA_OVERRIDE sdma_multicast() const { return sdma_multicast_; }
 
+  // Forced (masqueraded) gfx target, or empty when unset. Set via HSA_FORCE_GFX.
+  // Identity-only.
+  const std::string& force_gfx() const { return force_gfx_; }
+
+  // Whether an ASIC revision override is in effect and its value.
+  bool force_asic_revision_set() const { return force_asic_revision_set_; }
+
+  uint32_t force_asic_revision() const { return force_asic_revision_; }
+
   [[nodiscard]]
   bool core_dump_disable() const { return core_dump_disable_; }
 
@@ -590,6 +622,12 @@ class Flag {
   SDMA_OVERRIDE sdma_linear_b2b_ = SDMA_DEFAULT;
 
   SDMA_OVERRIDE sdma_multicast_ = SDMA_DEFAULT;
+
+  // General GPU masquerade overrides (identity-only). Empty / unset means no
+  // override.
+  std::string force_gfx_;
+  bool force_asic_revision_set_ = false;
+  uint32_t force_asic_revision_ = 0;
 
   SDMA_OVERRIDE enable_sdma_;
   SDMA_OVERRIDE enable_peer_sdma_;

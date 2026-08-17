@@ -44,8 +44,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cinttypes>
 #include <climits>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <set>
@@ -98,6 +100,59 @@ namespace rocr {
 
 namespace AMD {
 const uint64_t CP_DMA_DATA_TRANSFER_CNT_MAX = (1 << 26);
+
+namespace {
+
+// Parse a "gfxNNN" target string into an Isa::Version. The ROCr convention is
+// that the last digit is the stepping, the second-to-last is the minor version,
+// and the remaining leading digits are the major version (e.g. gfx950 ->
+// (9,5,0), gfx1100 -> (11,0,0), gfx1250 -> (12,5,0)). Any ":feature" suffix is
+// ignored here (features are resolved separately). Returns false if the string
+// is not a well-formed gfx target.
+bool ParseForcedGfxVersion(const std::string& gfx, core::Isa::Version* out) {
+  if (gfx.compare(0, 3, "gfx") != 0) return false;
+  std::string digits = gfx.substr(3);
+  const auto colon = digits.find(':');
+  if (colon != std::string::npos) digits = digits.substr(0, colon);
+  if (digits.size() < 3 ||
+      !std::all_of(digits.begin(), digits.end(),
+                   [](unsigned char c) { return std::isdigit(c) != 0; })) {
+    return false;
+  }
+  const int stepping = digits[digits.size() - 1] - '0';
+  const int minor = digits[digits.size() - 2] - '0';
+  const int major = std::stoi(digits.substr(0, digits.size() - 2));
+  *out = core::Isa::Version(major, minor, stepping);
+  return true;
+}
+
+// Resolve HSA_FORCE_GFX (via flag precedence) to a concrete registered ISA. A
+// fully-qualified target id with features (e.g. "gfx950:sramecc+:xnack-") is
+// looked up verbatim; a bare "gfx950" is resolved to a concrete feature variant
+// (SRAMECC on / XNACK off when supported, matching the usual --offload-arch
+// default) so code-object ISA compatibility -- which requires a pinned agent
+// feature -- is well defined. Returns nullptr if the string cannot be resolved.
+const core::Isa* ResolveForcedIsa(const std::string& forced) {
+  constexpr char kPrefix[] = "amdgcn-amd-amdhsa--";
+  if (forced.find(':') != std::string::npos) {
+    return core::IsaRegistry::GetIsa(kPrefix + forced);
+  }
+
+  const core::Isa* base = core::IsaRegistry::GetIsa(kPrefix + forced);
+  core::Isa::Version version;
+  if (base == nullptr || !ParseForcedGfxVersion(forced, &version)) {
+    return base;
+  }
+
+  const core::IsaFeature sramecc =
+      base->IsSrameccSupported() ? core::IsaFeature::Enabled : core::IsaFeature::Unsupported;
+  const core::IsaFeature xnack =
+      base->IsXnackSupported() ? core::IsaFeature::Disabled : core::IsaFeature::Unsupported;
+  const core::Isa* concrete = core::IsaRegistry::GetIsa(version, sramecc, xnack);
+  return concrete != nullptr ? concrete : base;
+}
+
+}  // namespace
 
 GpuAgent::GpuAgent(HSAuint32 node, const HsaNodeProperties& node_props, bool xnack_mode,
                    uint32_t index, core::DriverType driver_type)
@@ -204,6 +259,51 @@ GpuAgent::GpuAgent(HSAuint32 node, const HsaNodeProperties& node_props, bool xna
   supported_isas_.push_back(isa);
   if (!supported_isas_[0]->GetIsaGeneric().empty()) {
     supported_isas_.push_back(core::IsaRegistry::GetIsa(supported_isas_[0]->GetIsaGeneric()));
+  }
+
+  // GPU masquerade (IDENTITY ONLY). By default the agent reports its real ISA
+  // and ASIC revision. If HSA_FORCE_GFX / HSA_FORCE_ASIC_REVISION is set, we
+  // build a SEPARATE reported identity that is surfaced to the whole runtime and
+  // to applications via hsa_agent_get_info(ISA/NAME), hsa_agent_iterate_isas,
+  // HIP gcnArchName, and code-object load compatibility. This is the single
+  // source of truth the hotswap decision also consumes.
+  //
+  // GUARDRAIL: supported_isas_ (the physical ISA) is left untouched, so queue
+  // creation, doorbell, memory, blit/PM4 generation, scratch and trap-handler
+  // selection all keep targeting the real device. Only reported strings change.
+  // Executing a kernel whose ISA does not match the physical device WILL fault
+  // unless HSA_ENABLE_IFH=1 (no execution) or hotswap rewrites the code object.
+  reported_isas_ = supported_isas_;
+  reported_asic_revision_ = static_cast<uint32_t>(properties_.Capability.ui32.ASICRevision);
+
+  const std::string& force_gfx = core::Runtime::runtime_singleton_->flag().force_gfx();
+  if (!force_gfx.empty()) {
+    const core::Isa* forced = ResolveForcedIsa(force_gfx);
+    if (forced != nullptr) {
+      reported_isas_.clear();
+      reported_isas_.push_back(forced);
+      if (!forced->GetIsaGeneric().empty()) {
+        const core::Isa* forced_generic = core::IsaRegistry::GetIsa(forced->GetIsaGeneric());
+        if (forced_generic != nullptr) reported_isas_.push_back(forced_generic);
+      }
+      fprintf(stderr,
+              "[ROCr masquerade] GPU node %u now REPORTS gfx target '%s' (real "
+              "device is '%s'). Identity only: queues/doorbell/memory use the "
+              "real device -- executing a mismatched ISA will fault unless "
+              "HSA_ENABLE_IFH=1 or hotswap rewrites the code object.\n",
+              node, forced->GetProcessorName().c_str(),
+              supported_isas_[0]->GetProcessorName().c_str());
+    } else {
+      fprintf(stderr,
+              "[ROCr masquerade] HSA_FORCE_GFX='%s' did "
+              "not resolve to a known ISA; keeping real identity.\n",
+              force_gfx.c_str());
+    }
+  }
+
+  if (core::Runtime::runtime_singleton_->flag().force_asic_revision_set()) {
+    reported_asic_revision_ =
+        core::Runtime::runtime_singleton_->flag().force_asic_revision();
   }
 
   if (supported_isas_[0]->GetMajorVersion() == 12 && supported_isas_[0]->GetMinorVersion() >= 5) {
@@ -718,7 +818,10 @@ hsa_status_t GpuAgent::IterateSupportedIsas(
                     hsa_status_t (*callback)(hsa_isa_t isa, void* data),
                                                           void* data) const {
   AMD::callback_t<decltype(callback)> call(callback);
-  for (const auto& isa : supported_isas()) {
+  // Report the masqueraded identity: this is the surface the code-object loader
+  // (LoaderContext::IsaSupportedByAgent) uses to decide ISA compatibility, so a
+  // forced gfx target makes matching code objects load onto this agent.
+  for (const auto& isa : reported_isas()) {
     hsa_status_t stat = call(core::Isa::Handle(isa), data);
     if (stat != HSA_STATUS_SUCCESS) return stat;
   }
@@ -2189,7 +2292,9 @@ hsa_status_t GpuAgent::GetInfo(hsa_agent_info_t attribute, void* value) const {
 
   switch (attribute_u) {
     case HSA_AGENT_INFO_NAME: {
-      const std::string& name = supported_isas()[0]->GetProcessorName();
+      // Reported (possibly masqueraded) processor name -- this is what HIP reads
+      // back as gcnArchName.
+      const std::string& name = reported_isas()[0]->GetProcessorName();
       const size_t n = std::min(name.size(), hsa_name_size);
       std::memset(value, 0, hsa_name_size + 1);
       std::memcpy(value, name.data(), n);
@@ -2297,7 +2402,7 @@ hsa_status_t GpuAgent::GetInfo(hsa_agent_info_t attribute, void* value) const {
       }
     } break;
     case HSA_AGENT_INFO_ISA:
-      *((hsa_isa_t*)value) = core::Isa::Handle(supported_isas()[0]);
+      *((hsa_isa_t*)value) = core::Isa::Handle(reported_isas()[0]);
       break;
     case HSA_AGENT_INFO_EXTENSIONS: {
       memset(value, 0, sizeof(uint8_t) * 128);
@@ -2452,7 +2557,8 @@ hsa_status_t GpuAgent::GetInfo(hsa_agent_info_t attribute, void* value) const {
       break;
     }
     case HSA_AMD_AGENT_INFO_ASIC_REVISION:
-      *((uint32_t*)value) = static_cast<uint32_t>(properties_.Capability.ui32.ASICRevision);
+      // Reported (possibly masqueraded) ASIC stepping.
+      *((uint32_t*)value) = reported_asic_revision_;
       break;
     case HSA_AMD_AGENT_INFO_SVM_DIRECT_HOST_ACCESS:
       assert(regions_.size() != 0 && "No device local memory found!");

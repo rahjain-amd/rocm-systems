@@ -426,6 +426,16 @@ class GpuAgent : public GpuAgentInt {
   const std::vector<const core::Isa *>& supported_isas() const override {
                                                       return supported_isas_;}
 
+  // @brief Reported (possibly masqueraded) ISA list. Identical to
+  // supported_isas() unless HSA_FORCE_GFX is set. ONLY
+  // agent-identity reporting (hsa_agent_get_info ISA/NAME, hsa_agent_iterate_isas)
+  // and code-object load compatibility observe this list; every physical device
+  // path (queues, doorbell, blit, PM4, scratch, trap handler) keeps using
+  // supported_isas() so real execution is never retargeted.
+  const std::vector<const core::Isa *>& reported_isas() const {
+    return reported_isas_.empty() ? supported_isas_ : reported_isas_;
+  }
+
   // @brief Override from AMD::GpuAgentInt.
   __forceinline hsa_profile_t profile() const override { return profile_; }
 
@@ -1091,6 +1101,12 @@ class GpuAgent : public GpuAgentInt {
   hsa_amd_dim3_t cluster_max_dim_;
 
   size_t max_wave_scratch_;
+
+  // @brief Masqueraded identity (see reported_isas()). Populated in the ctor:
+  // equal to supported_isas_ unless a force flag is set. reported_asic_revision_
+  // is the ASIC stepping reported via HSA_AMD_AGENT_INFO_ASIC_REVISION.
+  std::vector<const core::Isa *> reported_isas_;
+  uint32_t reported_asic_revision_ = 0;
 
   DISALLOW_COPY_AND_ASSIGN(GpuAgent);
 };
