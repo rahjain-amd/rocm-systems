@@ -48,6 +48,16 @@ configure_file(
 
 add_library(${ROCM_SMI_TARGET} ${CMN_SRC_LIST} ${CMN_INC_LIST})
 target_link_libraries(${ROCM_SMI_TARGET} PRIVATE rt Threads::Threads ${CMAKE_DL_LIBS} ${FILESYSTEM_LIB})
+# WSL2 DXG topology backend needs the hsaKmt headers (hsakmt/hsakmttypes.h)
+# shipped with the DXG thunk (librocdxg). librocdxg itself is loaded via dlopen
+# at runtime, so only the headers are required at build time. The path defaults
+# to the local rocr-runtime checkout and can be overridden with -DHSAKMT_INCLUDE_DIR.
+if(NOT DEFINED HSAKMT_INCLUDE_DIR)
+    set(HSAKMT_INCLUDE_DIR
+        "${PROJECT_SOURCE_DIR}/../rocr-runtime/libhsakmt/include"
+        CACHE PATH "Path to hsaKmt headers for the WSL DXG backend")
+endif()
+
 target_include_directories(
     ${ROCM_SMI_TARGET}
     PRIVATE
@@ -55,6 +65,7 @@ target_include_directories(
         ${PROJECT_SOURCE_DIR}/common/shared_mutex
         ${DRM_INCLUDE_DIRS}
         ${DRM_AMDGPU_INCLUDE_DIRS}
+        ${HSAKMT_INCLUDE_DIR}
 )
 
 # use the target_include_directories() command to specify the include directories for the target

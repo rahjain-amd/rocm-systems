@@ -41,6 +41,11 @@ class KFDNode {
   ~KFDNode();
 
   int Initialize();
+  // WSL2 initialization: populate this node in-memory from DXG-sourced topology
+  // (librocdxg / hsaKmt*) instead of reading /sys/class/kfd, which does not
+  // exist on WSL. Mirrors the fields Initialize() would otherwise read.
+  void InitializeWSL(uint64_t gpu_id, const std::string& name, uint64_t location_id,
+                     uint64_t domain, uint32_t simd_count);
   int ReadProperties(void);
   int get_property_value(std::string property, uint64_t* value);
   uint64_t gpu_id(void) const { return gpu_id_; }
@@ -98,6 +103,10 @@ class KFDNode {
 };
 
 int DiscoverKFDNodes(std::map<uint64_t, std::shared_ptr<KFDNode>>* nodes);
+// WSL2 variant: builds the KFD node map from DXG topology (librocdxg / hsaKmt*)
+// keyed by bdfid, matching the device list built by RocmSMI::DiscoverAmdgpuDevices
+// on WSL. Native Linux continues to use DiscoverKFDNodes().
+int DiscoverKFDNodesWSL(std::map<uint64_t, std::shared_ptr<KFDNode>>* nodes);
 
 int GetProcessInfo(rsmi_process_info_t* procs, uint32_t num_allocated, uint32_t* num_procs_found);
 int GetProcessInfoForPID(uint32_t pid, rsmi_process_info_t* proc,

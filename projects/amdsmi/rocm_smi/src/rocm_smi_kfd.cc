@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "rocm_smi/rocm_smi.h"
+#include "rocm_smi/rocm_smi_dxg.h"
 #include "rocm_smi/rocm_smi_exception.h"
 #include "rocm_smi/rocm_smi_io_link.h"
 #include "rocm_smi/rocm_smi_kfd_data_manager.h"
@@ -1060,7 +1061,54 @@ int DiscoverKFDNodes(std::map<uint64_t, std::shared_ptr<KFDNode>>* nodes) {
   return 0;
 }
 
+int DiscoverKFDNodesWSL(std::map<uint64_t, std::shared_ptr<KFDNode>>* nodes) {
+  std::ostringstream ss;
+  assert(nodes != nullptr);
+  if (nodes == nullptr) {
+    return EINVAL;
+  }
+  nodes->clear();
+
+  std::vector<DxgNodeInfo> dxg_nodes;
+  if (!DxgEnumerateGpuNodes(&dxg_nodes)) {
+    ss << __PRETTY_FUNCTION__ << " | DXG topology enumeration failed";
+    LOG_ERROR(ss);
+    // Non-fatal: return success with an empty map so init does not throw. The
+    // device list will simply be empty, which amd-smi reports gracefully.
+    return 0;
+  }
+
+  for (const auto& n : dxg_nodes) {
+    auto node = std::make_shared<KFDNode>(n.node_index);
+    node->InitializeWSL(n.gpu_id, n.name, n.location_id, n.domain, n.simd_count);
+    (*nodes)[n.bdfid] = node;
+    ss << __PRETTY_FUNCTION__ << " | WSL kfd node bdfid=" << n.bdfid << " gpu_id=" << n.gpu_id
+       << " name='" << n.name << "'";
+    LOG_INFO(ss);
+  }
+  return 0;
+}
+
 KFDNode::~KFDNode() = default;
+
+void KFDNode::InitializeWSL(uint64_t gpu_id, const std::string& name, uint64_t location_id,
+                            uint64_t domain, uint32_t simd_count) {
+  gpu_id_ = gpu_id;
+  name_ = name;
+  xgmi_hive_id_ = 0;
+  numa_node_number_ = 0;
+  numa_node_weight_ = 0;
+  numa_node_type_ = IOLINK_TYPE_UNDEFINED;
+  // Compute-unit count is not available through the DXG topology; expose the
+  // SIMD count as a best-effort placeholder until P1 wires clocks/CU details.
+  cu_count_ = simd_count;
+  // Populate the property map so the standard rsmi_* accessors (which read from
+  // properties_ via get_property_value) work unchanged on WSL.
+  properties_["location_id"] = location_id;
+  properties_["domain"] = domain;
+  properties_["simd_count"] = simd_count;
+  properties_["hive_id"] = 0;
+}
 
 int KFDNode::ReadProperties(void) {
   int ret;

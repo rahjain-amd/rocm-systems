@@ -167,6 +167,15 @@ function(amdsmi_configure_common_target _TARGET)
         ${_TARGET}
         PRIVATE rt Threads::Threads ${CMAKE_DL_LIBS} amdsminic ${FILESYSTEM_LIB} ${UALOE_LINK_LIBRARIES}
     )
+    # WSL DXG backend (rocm_smi_dxg.cc, part of CMN_SRC_LIST) needs the hsaKmt
+    # headers. Use BEFORE so the correct (DXG thunk) hsakmttypes.h wins over any
+    # older copy that might sit on another include path.
+    target_include_directories(
+        ${_TARGET}
+        BEFORE
+        PRIVATE
+            ${HSAKMT_INCLUDE_DIR}
+    )
     target_include_directories(
         ${_TARGET}
         PRIVATE

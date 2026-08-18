@@ -71,8 +71,30 @@ AMDSMI_INIT_FLAG = amdsmi_interface.AmdSmiInitFlags.INIT_ALL_PROCESSORS
 AMD_VENDOR_ID = 4098
 
 
+def is_wsl():
+    """Returns true when running under WSL2.
+
+    On WSL2 the GPU is exposed through the DXG paravirt stack (/dev/dxg) while
+    the KFD sysfs topology (/sys/class/kfd) is absent, so the usual amdgpu
+    driver probes below never succeed. Detect WSL so init can proceed against
+    the DXG-backed enumeration path in the C library.
+    """
+    if os.path.exists("/dev/dxg") and not os.path.exists("/sys/class/kfd"):
+        return True
+    try:
+        with open("/proc/version", "r", encoding="ascii", errors="ignore") as f:
+            return "microsoft" in f.read().lower()
+    except OSError:
+        return False
+
+
 def check_amdgpu_driver():
     """Returns true if amdgpu is found in the list of initialized modules"""
+    # On WSL2 dxgkrnl is the GPU driver; treat /dev/dxg as a live GPU driver so
+    # initialization proceeds and the DXG enumeration backend can run.
+    if is_wsl():
+        return True
+
     amd_gpu_status_file = Path("/sys/module/amdgpu/initstate")
     if amd_gpu_status_file.exists():
         try:

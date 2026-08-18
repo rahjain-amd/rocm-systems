@@ -39,6 +39,7 @@
 
 #include "rocm_smi/rocm_smi.h"
 #include "rocm_smi/rocm_smi_device.h"
+#include "rocm_smi/rocm_smi_dxg.h"
 #include "rocm_smi/rocm_smi_exception.h"
 #include "rocm_smi/rocm_smi_kfd.h"
 #include "rocm_smi/rocm_smi_kfd_data_manager.h"
@@ -329,21 +330,32 @@ void RocmSMI::Initialize(uint64_t flags) {
   }
 
   std::map<uint64_t, std::shared_ptr<KFDNode>> tmp_map;
-  i_ret = DiscoverKFDNodes(&tmp_map);
-  if (i_ret != 0) {
-    throw amd::smi::rsmi_exception(RSMI_INITIALIZATION_ERROR,
-                                   "Failed to initialize rocm_smi library (KFD node discovery).");
-  }
+  if (is_wsl()) {
+    // WSL2: build the KFD node map from DXG topology instead of /sys/class/kfd,
+    // and skip IO-link discovery (no KFD sysfs io_links on WSL).
+    i_ret = DiscoverKFDNodesWSL(&tmp_map);
+    if (i_ret != 0) {
+      throw amd::smi::rsmi_exception(
+          RSMI_INITIALIZATION_ERROR,
+          "Failed to initialize rocm_smi library (WSL KFD node discovery).");
+    }
+  } else {
+    i_ret = DiscoverKFDNodes(&tmp_map);
+    if (i_ret != 0) {
+      throw amd::smi::rsmi_exception(RSMI_INITIALIZATION_ERROR,
+                                     "Failed to initialize rocm_smi library (KFD node discovery).");
+    }
 
-  std::map<std::pair<uint32_t, uint32_t>, std::shared_ptr<IOLink>> io_link_map_tmp;
-  i_ret = DiscoverIOLinks(&io_link_map_tmp);
-  if (i_ret != 0) {
-    throw amd::smi::rsmi_exception(RSMI_INITIALIZATION_ERROR,
-                                   "Failed to initialize rocm_smi library (IO Links discovery).");
+    std::map<std::pair<uint32_t, uint32_t>, std::shared_ptr<IOLink>> io_link_map_tmp;
+    i_ret = DiscoverIOLinks(&io_link_map_tmp);
+    if (i_ret != 0) {
+      throw amd::smi::rsmi_exception(RSMI_INITIALIZATION_ERROR,
+                                     "Failed to initialize rocm_smi library (IO Links discovery).");
+    }
+    std::map<std::pair<uint32_t, uint32_t>, std::shared_ptr<IOLink>>::iterator it;
+    for (it = io_link_map_tmp.begin(); it != io_link_map_tmp.end(); it++)
+      io_link_map_[it->first] = it->second;
   }
-  std::map<std::pair<uint32_t, uint32_t>, std::shared_ptr<IOLink>>::iterator it;
-  for (it = io_link_map_tmp.begin(); it != io_link_map_tmp.end(); it++)
-    io_link_map_[it->first] = it->second;
 
   // Remove any drm nodes that don't have  a corresponding readable kfd node.
   // kfd nodes will not be added if their properties file is not readable.
@@ -1105,9 +1117,47 @@ uint32_t GetLargestNodeNumber(const std::string& path = "/sys/class/kfd/kfd/topo
   return largest_node_number;
 }
 
+uint32_t RocmSMI::DiscoverDxgDevices(void) {
+  std::ostringstream ss;
+
+  // If this gets called more than once, clear previous findings.
+  devices_.clear();
+  monitors_.clear();
+
+  std::vector<DxgNodeInfo> dxg_nodes;
+  if (!DxgEnumerateGpuNodes(&dxg_nodes)) {
+    ss << __PRETTY_FUNCTION__ << " | DXG enumeration failed";
+    LOG_ERROR(ss);
+    // Non-fatal: leave the device list empty rather than aborting init so
+    // `amd-smi` still runs and reports zero GPUs gracefully.
+    return 0;
+  }
+
+  for (const auto& n : dxg_nodes) {
+    rsmi_device_enumeration_t rsmi_device;
+    // No DRM node exists on WSL; give the device a synthetic card name so
+    // AddToDeviceList2() skips the DRM render-path lookup (which would touch
+    // absent sysfs), and key it on the synthesized bdfid.
+    rsmi_device.dev_name = "card" + std::to_string(n.node_index);
+    rsmi_device.bdfid = n.bdfid;
+    rsmi_device.drm_render_minor = n.drm_render_minor;
+    AddToDeviceList2(rsmi_device);
+    ss << __PRETTY_FUNCTION__ << " | added WSL DXG device bdfid=" << n.bdfid
+       << " name='" << n.name << "'";
+    LOG_INFO(ss);
+  }
+  return 0;
+}
+
 uint32_t RocmSMI::DiscoverAmdgpuDevices(void) {
   std::string err_msg;
   std::ostringstream ss;
+
+  // On WSL2 there is no /sys/class/kfd topology; source the GPU list from the
+  // DXG thunk (librocdxg / hsaKmt*) instead of the KFD sysfs walk below.
+  if (is_wsl()) {
+    return DiscoverDxgDevices();
+  }
 
   // If this gets called more than once, clear previous findings.
   devices_.clear();
