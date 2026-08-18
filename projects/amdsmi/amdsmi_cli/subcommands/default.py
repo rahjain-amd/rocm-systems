@@ -120,8 +120,12 @@ class DefaultCommands:
                 asic_info = amdsmi_interface.amdsmi_get_gpu_asic_info(processor)
                 market_name = asic_info["market_name"]
                 oam_id = asic_info["oam_id"]
-                # get num_cu now for use later
-                total_num_cu = float(asic_info["num_compute_units"])
+                # get num_cu now for use later; may be non-numeric ("N/A") on
+                # platforms (e.g. WSL) that cannot report compute units.
+                try:
+                    total_num_cu = float(asic_info["num_compute_units"])
+                except (ValueError, TypeError):
+                    total_num_cu = "N/A"
             except amdsmi_exception.AmdSmiLibraryException:
                 market_name = "N/A"
                 oam_id = "N/A"

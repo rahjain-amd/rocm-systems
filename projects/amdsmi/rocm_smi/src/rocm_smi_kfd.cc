@@ -1080,7 +1080,7 @@ int DiscoverKFDNodesWSL(std::map<uint64_t, std::shared_ptr<KFDNode>>* nodes) {
 
   for (const auto& n : dxg_nodes) {
     auto node = std::make_shared<KFDNode>(n.node_index);
-    node->InitializeWSL(n.gpu_id, n.name, n.location_id, n.domain, n.simd_count);
+    node->InitializeWSL(n);
     (*nodes)[n.bdfid] = node;
     ss << __PRETTY_FUNCTION__ << " | WSL kfd node bdfid=" << n.bdfid << " gpu_id=" << n.gpu_id
        << " name='" << n.name << "'";
@@ -1091,23 +1091,41 @@ int DiscoverKFDNodesWSL(std::map<uint64_t, std::shared_ptr<KFDNode>>* nodes) {
 
 KFDNode::~KFDNode() = default;
 
-void KFDNode::InitializeWSL(uint64_t gpu_id, const std::string& name, uint64_t location_id,
-                            uint64_t domain, uint32_t simd_count) {
-  gpu_id_ = gpu_id;
-  name_ = name;
+void KFDNode::InitializeWSL(const DxgNodeInfo& n) {
+  gpu_id_ = n.gpu_id;
+  name_ = n.name;
   xgmi_hive_id_ = 0;
   numa_node_number_ = 0;
   numa_node_weight_ = 0;
   numa_node_type_ = IOLINK_TYPE_UNDEFINED;
   // Compute-unit count is not available through the DXG topology; expose the
-  // SIMD count as a best-effort placeholder until P1 wires clocks/CU details.
-  cu_count_ = simd_count;
+  // SIMD count as a best-effort placeholder.
+  cu_count_ = n.simd_count;
   // Populate the property map so the standard rsmi_* accessors (which read from
   // properties_ via get_property_value) work unchanged on WSL.
-  properties_["location_id"] = location_id;
-  properties_["domain"] = domain;
-  properties_["simd_count"] = simd_count;
+  properties_["location_id"] = n.location_id;
+  properties_["domain"] = n.domain;
+  properties_["simd_count"] = n.simd_count;
   properties_["hive_id"] = 0;
+
+  // P1: stash the DXG-captured static data so the rsmi_* getters can source
+  // clocks/VRAM/ids from here instead of the absent amdgpu sysfs.
+  is_wsl_node_ = true;
+  wsl_vendor_id_ = n.vendor_id;
+  wsl_device_id_ = n.device_id;
+  wsl_max_gfx_clk_mhz_ = n.max_gfx_clk_mhz;
+  wsl_max_mem_clk_mhz_ = n.max_mem_clk_mhz;
+  wsl_vram_total_bytes_ = n.vram_total_bytes;
+  wsl_luid_low_ = n.luid_low;
+  wsl_luid_high_ = n.luid_high;
+  wsl_luid_valid_ = n.luid_valid;
+}
+
+bool KFDNode::wsl_query_live_stats(uint32_t sample_ms, DxgLiveStats* out) const {
+  if (out == nullptr || !is_wsl_node_) {
+    return false;
+  }
+  return DxgQueryLiveStats(wsl_luid_low_, wsl_luid_high_, wsl_luid_valid_, sample_ms, out);
 }
 
 int KFDNode::ReadProperties(void) {
@@ -1301,6 +1319,16 @@ int KFDNode::get_total_memory(uint64_t* total) {
   }
   *total = 0;
 
+  // WSL2: there is no /sys/class/kfd/.../mem_banks to walk. Return the VRAM
+  // total captured from the DXG topology (sum of FRAME_BUFFER heaps).
+  if (is_wsl_node_) {
+    if (wsl_vram_total_bytes_ == 0) {
+      return ENXIO;
+    }
+    *total = wsl_vram_total_bytes_;
+    return 0;
+  }
+
   std::string f_path = kKFDNodesPathRoot;
   f_path += "/";
   f_path += std::to_string(node_indx_);
@@ -1406,6 +1434,18 @@ int KFDNode::get_used_memory(uint64_t* used) {
   if (used == nullptr) return EINVAL;
 
   *used = 0;
+
+  // WSL2: /dev/kfd is absent, so the ioctl/fork paths below cannot run. Source
+  // live VRAM residency from the DXG D3DKMT statistics query instead.
+  if (is_wsl_node_) {
+    DxgLiveStats stats;
+    if (wsl_query_live_stats(/*sample_ms=*/0, &stats) && stats.vram_used_valid) {
+      *used = stats.vram_used_bytes;
+      return 0;
+    }
+    return ENXIO;
+  }
+
   int ret = 0;
   uint64_t available = 0;
   std::ostringstream ss;

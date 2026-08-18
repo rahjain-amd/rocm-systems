@@ -44,6 +44,30 @@ struct DxgNodeInfo {
   uint32_t drm_render_minor = 0;
   uint64_t local_mem_size = 0;
   std::string name;             // marketing name
+
+  // P1: static clock/VRAM data captured from the same hsaKmt topology query.
+  // These are the hardware maxima the DXG topology reports (not live values);
+  // live values come from DxgQueryLiveStats() via a direct D3DKMT query.
+  uint32_t max_gfx_clk_mhz = 0;  // MaxEngineClockMhzFCompute (max gfx/SCLK)
+  uint32_t max_mem_clk_mhz = 0;  // MemoryClockMax of the VRAM bank (max MCLK)
+  uint64_t vram_total_bytes = 0; // sum of FRAME_BUFFER heap SizeInBytes
+
+  // Windows adapter LUID (from HsaNodeProperties Luid{Low,High}Part). Used to
+  // match this GPU to a D3DKMT adapter for the live statistics query.
+  uint32_t luid_low = 0;
+  int32_t luid_high = 0;
+  bool luid_valid = false;
+};
+
+// Live per-GPU statistics sourced from a direct D3DKMT query (libdxcore.so /
+// D3DKMTQueryStatistics). These are the values the hsaKmt topology cannot give:
+// current VRAM residency and engine utilization. Fields carry an explicit valid
+// flag so callers can cleanly report N/A when a value could not be sampled.
+struct DxgLiveStats {
+  uint64_t vram_used_bytes = 0;   // sum of BytesResident over local (non-aperture) segments
+  bool vram_used_valid = false;
+  uint32_t gfx_activity_pct = 0;  // busiest engine node's running-time delta over the sample window
+  bool gfx_activity_valid = false;
 };
 
 // Returns true when running under WSL2, where /dev/dxg is present and the KFD
@@ -57,6 +81,17 @@ bool is_wsl();
 // loaded via dlopen at runtime, so native Linux builds carry no hard link
 // dependency on it. Returns true on success (out populated, possibly empty).
 bool DxgEnumerateGpuNodes(std::vector<DxgNodeInfo>* out);
+
+// Samples live GPU statistics (VRAM used, engine utilization) for the adapter
+// matching the given LUID, via libdxcore.so's D3DKMT ABI. When luid_valid is
+// false (or no adapter matches the LUID) the first enumerated adapter is used,
+// which is correct for the common single-GPU WSL case. Engine utilization is
+// derived from D3DKMTQueryStatistics running-time deltas sampled over
+// sample_ms milliseconds. Returns true if at least one field was populated;
+// individual field validity is carried in DxgLiveStats. Safe to call on native
+// Linux (returns false because libdxcore.so is absent).
+bool DxgQueryLiveStats(uint32_t luid_low, int32_t luid_high, bool luid_valid,
+                       uint32_t sample_ms, DxgLiveStats* out);
 
 }  // namespace amd::smi
 

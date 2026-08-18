@@ -2493,6 +2493,23 @@ amdsmi_status_t amdsmi_get_gpu_asic_info(amdsmi_processor_handle processor_handl
     }
   }
 
+  // On WSL2 there is no amdgpu DRM render node (/dev/dri/renderD*), so the
+  // DRM ioctl path below cannot run. The device/vendor/market fields have
+  // already been populated from the DXG-backed rsmi getters above; return
+  // success with those instead of failing the whole call with FILE_ERROR.
+  if (amd::smi::is_wsl()) {
+    // rev_id is not available via the DXG topology path; leave as-is (N/A).
+    if (status == AMDSMI_STATUS_SUCCESS &&
+        kAsicInfoCacheDuration > std::chrono::milliseconds::zero()) {
+      auto now = std::chrono::steady_clock::now();
+      std::lock_guard<std::mutex> lk(cache_ptr->mtx);
+      cache_ptr->info = *info;
+      cache_ptr->last_read = now;
+      cache_ptr->valid = true;
+    }
+    return AMDSMI_STATUS_SUCCESS;
+  }
+
   std::string render_name = gpu_device->get_gpu_path();
   if (render_name.empty()) {
     return AMDSMI_STATUS_NOT_SUPPORTED;
@@ -4105,6 +4122,42 @@ amdsmi_status_t amdsmi_get_gpu_metrics_info(amdsmi_processor_handle processor_ha
     return AMDSMI_STATUS_INVAL;  // Return error if pgpu_metrics is null
   }
 
+  // WSL2: the amdgpu gpu_metrics sysfs blob is absent, so the normal rsmi read
+  // fails and the CLI (monitor/metric read these fields directly) would show
+  // everything as N/A. Synthesize a metrics table with every field set to its
+  // N/A sentinel (0xFF fill) and then populate only the values the DXG stack
+  // can provide: gfx/mem clocks (max, from the topology) and gfx activity
+  // (live, from D3DKMT). Fields we cannot source stay N/A rather than a fake 0.
+  if (amd::smi::is_wsl()) {
+    amd::smi::AMDSmiGPUDevice* gpu_device = nullptr;
+    amdsmi_status_t r = get_gpu_device_from_handle(processor_handle, &gpu_device);
+    if (r != AMDSMI_STATUS_SUCCESS) return r;
+    uint32_t gpu_index = gpu_device->get_gpu_id();
+
+    memset(pgpu_metrics, 0xFF, sizeof(*pgpu_metrics));
+    // Header and owned pointer must be sane (0xFF fill would corrupt them).
+    memset(&pgpu_metrics->common_header, 0, sizeof(pgpu_metrics->common_header));
+    pgpu_metrics->apu_metrics = nullptr;
+
+    rsmi_frequencies_t gfx_freq = {};
+    if (rsmi_dev_gpu_clk_freq_get(gpu_index, RSMI_CLK_TYPE_SYS, &gfx_freq) == RSMI_STATUS_SUCCESS) {
+      uint32_t idx = (gfx_freq.current < gfx_freq.num_supported) ? gfx_freq.current : 0;
+      uint16_t mhz = static_cast<uint16_t>(gfx_freq.frequency[idx] / 1000000ULL);
+      pgpu_metrics->current_gfxclk = mhz;      // singular: used by `monitor`
+      pgpu_metrics->current_gfxclks[0] = mhz;  // array: used by `metric` clock table
+    }
+    rsmi_frequencies_t mem_freq = {};
+    if (rsmi_dev_gpu_clk_freq_get(gpu_index, RSMI_CLK_TYPE_MEM, &mem_freq) == RSMI_STATUS_SUCCESS) {
+      uint32_t idx = (mem_freq.current < mem_freq.num_supported) ? mem_freq.current : 0;
+      pgpu_metrics->current_uclk = static_cast<uint16_t>(mem_freq.frequency[idx] / 1000000ULL);
+    }
+    uint32_t busy = 0;
+    if (rsmi_dev_busy_percent_get(gpu_index, &busy) == RSMI_STATUS_SUCCESS) {
+      pgpu_metrics->average_gfx_activity = static_cast<uint16_t>(busy);
+    }
+    return AMDSMI_STATUS_SUCCESS;
+  }
+
   *pgpu_metrics = amdsmi_gpu_metrics_t{};
   rsmi_gpu_metrics_t rsmi_metrics{};
   auto status = rsmi_wrapper(rsmi_dev_gpu_metrics_info_get, processor_handle, 0, &rsmi_metrics);
@@ -4913,6 +4966,25 @@ amdsmi_status_t amdsmi_get_gpu_activity(amdsmi_processor_handle processor_handle
   amdsmi_status_t r = get_gpu_device_from_handle(processor_handle, &gpu_device);
   if (r != AMDSMI_STATUS_SUCCESS) return r;
   amdsmi_status_t status;
+
+  // WSL2: no gpu_metrics blob. Derive gfx activity from the DXG D3DKMT engine
+  // statistics via rsmi_dev_busy_percent_get. Memory-controller (umc) and
+  // multimedia (mm) activity are not exposed by the DXG path -> report N/A
+  // (UINT16_MAX) so the CLI does not print a misleading 0%.
+  if (amd::smi::is_wsl()) {
+    uint32_t busy = 0;
+    uint32_t gpu_index = gpu_device->get_gpu_id();
+    rsmi_status_t rs = rsmi_dev_busy_percent_get(gpu_index, &busy);
+    info->mm_activity = std::numeric_limits<uint16_t>::max();
+    info->umc_activity = std::numeric_limits<uint16_t>::max();
+    if (rs != RSMI_STATUS_SUCCESS) {
+      info->gfx_activity = std::numeric_limits<uint16_t>::max();
+      return amd::smi::rsmi_to_amdsmi_status(rs);
+    }
+    info->gfx_activity = static_cast<uint16_t>(busy);
+    return AMDSMI_STATUS_SUCCESS;
+  }
+
   status = amdsmi_get_gpu_metrics_info(processor_handle, &metrics);
   if (status != AMDSMI_STATUS_SUCCESS) {
     return status;
@@ -4959,6 +5031,36 @@ amdsmi_status_t amdsmi_get_clock_info(amdsmi_processor_handle processor_handle,
   amdsmi_status_t r = get_gpu_device_from_handle(processor_handle, &gpu_device);
   if (r != AMDSMI_STATUS_SUCCESS) return r;
   amdsmi_status_t status;
+
+  // WSL2: the gpu_metrics blob and amdgpu clock ranges (sysfs) are unavailable.
+  // Source the clock from the DXG topology via rsmi_dev_gpu_clk_freq_get, which
+  // reports the max gfx/mem clock as the single (current) supported level.
+  // Only GFX and MEM are exposed by the DXG topology; the CLI shows N/A for the
+  // rest. These are MAX values, not live -- reported as both clk and max_clk.
+  if (amd::smi::is_wsl()) {
+    rsmi_clk_type_t rsmi_clk;
+    if (clk_type == AMDSMI_CLK_TYPE_GFX) {
+      rsmi_clk = RSMI_CLK_TYPE_SYS;
+    } else if (clk_type == AMDSMI_CLK_TYPE_MEM) {
+      rsmi_clk = RSMI_CLK_TYPE_MEM;
+    } else {
+      return AMDSMI_STATUS_NOT_SUPPORTED;
+    }
+    rsmi_frequencies_t freqs = {};
+    uint32_t gpu_index = gpu_device->get_gpu_id();
+    rsmi_status_t rs = rsmi_dev_gpu_clk_freq_get(gpu_index, rsmi_clk, &freqs);
+    if (rs != RSMI_STATUS_SUCCESS) {
+      return amd::smi::rsmi_to_amdsmi_status(rs);
+    }
+    uint32_t idx = (freqs.current < freqs.num_supported) ? freqs.current : 0;
+    uint32_t mhz = static_cast<uint32_t>(freqs.frequency[idx] / 1000000ULL);
+    info->clk = mhz;      // best-effort "current" == max on WSL
+    info->max_clk = mhz;  // hardware maximum from DXG topology
+    info->min_clk = 0;
+    info->clk_deep_sleep = 0;
+    info->clk_locked = 0;
+    return AMDSMI_STATUS_SUCCESS;
+  }
 
   status = amdsmi_get_gpu_metrics_info(processor_handle, &metrics);
   if (status != AMDSMI_STATUS_SUCCESS) {
