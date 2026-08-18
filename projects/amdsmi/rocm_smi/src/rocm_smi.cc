@@ -49,6 +49,7 @@
 #include "rocm_smi/rocm_smi_common.h"  // Should go before rocm_smi.h
 #include "rocm_smi/rocm_smi_counters.h"
 #include "rocm_smi/rocm_smi_device.h"
+#include "rocm_smi/rocm_smi_dxg.h"
 #include "rocm_smi/rocm_smi_exception.h"
 #include "rocm_smi/rocm_smi_gpu_metrics.h"
 #include "rocm_smi/rocm_smi_io_link.h"
@@ -541,6 +542,14 @@ rsmi_status_t rsmi_shut_down(void) {
 
 rsmi_status_t rsmi_driver_status(rsmi_driver_state_t* state) {
   TRY if (state == nullptr) { return RSMI_STATUS_INVALID_ARGS; }
+
+  // On WSL2 the GPU is driven by dxgkrnl (via the DXG paravirt stack), not the
+  // amdgpu kernel module, so /sys/module/amdgpu/initstate is absent. Report the
+  // driver as live so downstream init treats the GPU as available.
+  if (amd::smi::is_wsl()) {
+    *state = RSMI_DRIVER_MODULE_STATE_LIVE;
+    return RSMI_STATUS_SUCCESS;
+  }
 
   // live, coming, going
   static const char* kDevInitStateID = "/sys/module/amdgpu/initstate";

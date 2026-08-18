@@ -57,6 +57,9 @@ class RocmSMI {
   std::vector<std::shared_ptr<Device>>& switch_devices() { return switch_devices_; }
 
   uint32_t DiscoverAmdgpuDevices(void);
+  // WSL2 GPU discovery via the DXG thunk (librocdxg / hsaKmt*). Called from
+  // DiscoverAmdgpuDevices() when is_wsl() is true.
+  uint32_t DiscoverDxgDevices(void);
   uint32_t DiscoverBRCMnicDevices(void);
   uint32_t DiscoverBRCMswitchDevices(void);
   int DiscoverAMDPowerMonitors(bool force_update = false);

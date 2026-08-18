@@ -172,6 +172,10 @@ function(amdsmi_configure_common_target _TARGET)
         PRIVATE rt Threads::Threads ${CMAKE_DL_LIBS} amdsminic ${FILESYSTEM_LIB} ${UALOE_LINK_LIBRARIES}
     )
 
+    # develop's optional alternate WSL backend (amd_smi_wsl_device.cc). Left
+    # intact but OFF by default so it does not double-build against our
+    # rocm_smi_dxg.cc DXG path below. Enabling it requires the librocdxg-built
+    # rocdxg_smi.h header shipped by rocr-runtime/libhsakmt.
     if(ENABLE_WSL_BACKEND)
         target_compile_definitions(${_TARGET} PRIVATE ENABLE_WSL_BACKEND)
         set(_WSL_HSAKMT_INC "${PROJECT_SOURCE_DIR}/../rocr-runtime/libhsakmt/include")
@@ -186,6 +190,16 @@ function(amdsmi_configure_common_target _TARGET)
         target_include_directories(${_TARGET} PRIVATE ${_WSL_HSAKMT_INC})
     endif()
 
+    # Our WSL DXG backend (rocm_smi_dxg.cc, part of CMN_SRC_LIST) builds
+    # unconditionally and needs the hsaKmt headers. Use BEFORE so the correct
+    # (DXG thunk) hsakmttypes.h wins over any older copy that might sit on
+    # another include path.
+    target_include_directories(
+        ${_TARGET}
+        BEFORE
+        PRIVATE
+            ${HSAKMT_INCLUDE_DIR}
+    )
     target_include_directories(
         ${_TARGET}
         PRIVATE
