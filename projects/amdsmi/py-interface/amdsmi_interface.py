@@ -2868,7 +2868,11 @@ def amdsmi_get_gpu_asic_info(processor_handle: processor_handle_t) -> Dict[str, 
     )
 
     market_name = _pad_hex_value(asic_info_struct.market_name.decode("utf-8"), 4)
-    target_graphics_version = hex(asic_info_struct.target_graphics_version)[2:]
+    target_graphics_version = _validate_if_max_uint(
+        asic_info_struct.target_graphics_version, MaxUIntegerTypes.UINT64_T
+    )
+    if isinstance(target_graphics_version, int):
+        target_graphics_version = "gfx" + hex(target_graphics_version)[2:]
     subsystem_id = _validate_if_max_uint(asic_info_struct.subsystem_id, MaxUIntegerTypes.UINT32_T)
     subvendor_id = _validate_if_max_uint(asic_info_struct.subvendor_id, MaxUIntegerTypes.UINT32_T)
     if isinstance(subsystem_id, int):
@@ -2887,7 +2891,7 @@ def amdsmi_get_gpu_asic_info(processor_handle: processor_handle_t) -> Dict[str, 
         "num_compute_units": _validate_if_max_uint(
             asic_info_struct.num_of_compute_units, MaxUIntegerTypes.UINT32_T
         ),
-        "target_graphics_version": "gfx" + target_graphics_version,
+        "target_graphics_version": target_graphics_version,
         "subsystem_id": subsystem_id,
         "flags": asic_info_struct.flags,
     }

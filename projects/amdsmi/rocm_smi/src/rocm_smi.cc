@@ -1024,6 +1024,16 @@ rsmi_status_t rsmi_dev_id_get(uint32_t dv_ind, uint16_t* id) {
   // If the device ID is not supported, use KFD's device ID
   if (ret != RSMI_STATUS_SUCCESS) {
     GET_DEV_AND_KFDNODE_FROM_INDX
+    // WSL2: the sysfs node properties are absent; use the device id captured
+    // from the DXG topology.
+    if (kfd_node->is_wsl_node()) {
+      if (kfd_node->wsl_device_id() != 0) {
+        *id = kfd_node->wsl_device_id();
+        return RSMI_STATUS_SUCCESS;
+      }
+      *id = std::numeric_limits<uint16_t>::max();
+      return RSMI_STATUS_NOT_SUPPORTED;
+    }
     uint32_t node_id;
     uint64_t kfd_device_id;
     int ret_kfd = kfd_node->get_node_id(&node_id);
@@ -1156,6 +1166,15 @@ rsmi_status_t rsmi_dev_vendor_id_get(uint32_t dv_ind, uint16_t* id) {
   }
   if (ret != RSMI_STATUS_SUCCESS) {
     GET_DEV_AND_KFDNODE_FROM_INDX
+    // WSL2: sysfs node properties are absent; use the DXG-captured vendor id.
+    if (kfd_node->is_wsl_node()) {
+      if (kfd_node->wsl_vendor_id() != 0) {
+        *id = kfd_node->wsl_vendor_id();
+        return RSMI_STATUS_SUCCESS;
+      }
+      *id = std::numeric_limits<uint16_t>::max();
+      return RSMI_STATUS_NOT_SUPPORTED;
+    }
     uint64_t kfd_vendor_id;
     ret_kfd = kfd_node->get_node_id(&node_id);
     ret_kfd = amd::smi::read_node_properties(node_id, "vendor_id", &kfd_vendor_id);
@@ -2053,6 +2072,35 @@ rsmi_status_t rsmi_dev_gpu_clk_freq_get(uint32_t dv_ind, rsmi_clk_type_t clk_typ
 
   DEVICE_MUTEX
 
+  // WSL2: the amdgpu pp_dpm_* sysfs used by get_frequencies() is absent. Source
+  // the clock from the DXG topology instead. Only gfx (SYS) and memory (MEM)
+  // clocks are exposed by the DXG topology, and only as maxima -- report that
+  // single value as the (sole, current) supported level. Other domains return
+  // NOT_SUPPORTED so callers cleanly show N/A rather than an error.
+  if (amd::smi::is_wsl()) {
+    GET_DEV_AND_KFDNODE_FROM_INDX
+    if (!kfd_node->is_wsl_node()) {
+      return RSMI_STATUS_NOT_SUPPORTED;
+    }
+    uint32_t mhz = 0;
+    if (clk_type == RSMI_CLK_TYPE_SYS) {
+      mhz = kfd_node->wsl_max_gfx_clk_mhz();
+    } else if (clk_type == RSMI_CLK_TYPE_MEM) {
+      mhz = kfd_node->wsl_max_mem_clk_mhz();
+    } else {
+      return RSMI_STATUS_NOT_SUPPORTED;
+    }
+    if (mhz == 0) {
+      return RSMI_STATUS_NOT_SUPPORTED;
+    }
+    memset(f, 0, sizeof(rsmi_frequencies_t));
+    f->num_supported = 1;
+    f->current = 0;  // the single level is the current one (max-only on WSL)
+    f->has_deep_sleep = false;
+    f->frequency[0] = static_cast<uint64_t>(mhz) * 1000000ULL;  // MHz -> Hz
+    return RSMI_STATUS_SUCCESS;
+  }
+
   return get_frequencies(dev_type, clk_type, dv_ind, f);
 
   CATCH
@@ -2896,6 +2944,18 @@ rsmi_status_t rsmi_dev_brand_get(uint32_t dv_ind, char* brand, uint32_t len) {
     return RSMI_STATUS_INVALID_ARGS;
   }
   DEVICE_MUTEX
+
+  // WSL2: the vbios sysfs read below is unavailable. Return the marketing name
+  // captured from the DXG topology so asic-info shows the real board name.
+  if (amd::smi::is_wsl()) {
+    GET_DEV_AND_KFDNODE_FROM_INDX
+    if (kfd_node->is_wsl_node() && !kfd_node->name().empty()) {
+      memset(brand, 0, len);
+      strncpy(brand, kfd_node->name().c_str(), len - 1);
+      return RSMI_STATUS_SUCCESS;
+    }
+    return RSMI_STATUS_NOT_SUPPORTED;
+  }
 
   std::map<std::string, std::string> brand_names = {{"D05121", "mi25"}, {"D05131", "mi25"},
                                                     {"D05133", "mi25"}, {"D05151", "mi25"},
@@ -4539,6 +4599,23 @@ rsmi_status_t rsmi_dev_busy_percent_get(uint32_t dv_ind, uint32_t* busy_percent)
   CHK_SUPPORT_NAME_ONLY(busy_percent)
 
   DEVICE_MUTEX
+
+  // WSL2: the amdgpu gpu_busy_percent sysfs is absent. Derive utilization from
+  // the DXG D3DKMT engine running-time statistics (busiest engine over a short
+  // sample window). A genuinely idle GPU legitimately reports 0%.
+  if (amd::smi::is_wsl()) {
+    GET_DEV_AND_KFDNODE_FROM_INDX
+    if (!kfd_node->is_wsl_node()) {
+      return RSMI_STATUS_NOT_SUPPORTED;
+    }
+    amd::smi::DxgLiveStats stats;
+    if (kfd_node->wsl_query_live_stats(/*sample_ms=*/250, &stats) && stats.gfx_activity_valid) {
+      *busy_percent = stats.gfx_activity_pct;
+      return RSMI_STATUS_SUCCESS;
+    }
+    return RSMI_STATUS_NOT_SUPPORTED;
+  }
+
   rsmi_status_t ret = get_dev_value_str(amd::smi::kDevUsage, dv_ind, &val_str);
   if (ret != RSMI_STATUS_SUCCESS) {
     return ret;

@@ -31,6 +31,7 @@
 
 #include "rocm_smi/rocm_smi.h"
 #include "rocm_smi/rocm_smi_device.h"
+#include "rocm_smi/rocm_smi_dxg.h"
 #include "rocm_smi/rocm_smi_io_link.h"
 
 namespace amd::smi {
@@ -43,9 +44,9 @@ class KFDNode {
   int Initialize();
   // WSL2 initialization: populate this node in-memory from DXG-sourced topology
   // (librocdxg / hsaKmt*) instead of reading /sys/class/kfd, which does not
-  // exist on WSL. Mirrors the fields Initialize() would otherwise read.
-  void InitializeWSL(uint64_t gpu_id, const std::string& name, uint64_t location_id,
-                     uint64_t domain, uint32_t simd_count);
+  // exist on WSL. Mirrors the fields Initialize() would otherwise read, and
+  // stashes the P1 clock/VRAM/id data captured from the same topology query.
+  void InitializeWSL(const DxgNodeInfo& n);
   int ReadProperties(void);
   int get_property_value(std::string property, uint64_t* value);
   uint64_t gpu_id(void) const { return gpu_id_; }
@@ -83,6 +84,18 @@ class KFDNode {
   // Get node id from kfd
   int get_node_id(uint32_t* node_id);
 
+  // ---- WSL2 (DXG) accessors -------------------------------------------------
+  // True when this node was populated via InitializeWSL() (DXG topology) rather
+  // than the /sys/class/kfd walk. Guards the WSL-specific data below.
+  bool is_wsl_node(void) const { return is_wsl_node_; }
+  uint16_t wsl_vendor_id(void) const { return wsl_vendor_id_; }
+  uint16_t wsl_device_id(void) const { return wsl_device_id_; }
+  uint32_t wsl_max_gfx_clk_mhz(void) const { return wsl_max_gfx_clk_mhz_; }
+  uint32_t wsl_max_mem_clk_mhz(void) const { return wsl_max_mem_clk_mhz_; }
+  // Samples live VRAM-used + engine utilization for this node's adapter via the
+  // DXG D3DKMT path. Returns true if at least one field is valid.
+  bool wsl_query_live_stats(uint32_t sample_ms, DxgLiveStats* out) const;
+
  private:
   uint32_t node_indx_;
   uint32_t amdgpu_dev_index_;
@@ -100,6 +113,17 @@ class KFDNode {
   std::map<uint32_t, std::shared_ptr<IOLink>> io_link_map_;
   std::map<std::string, uint64_t> properties_;
   std::shared_ptr<Device> amdgpu_device_;
+
+  // ---- WSL2 (DXG) captured data --------------------------------------------
+  bool is_wsl_node_ = false;
+  uint16_t wsl_vendor_id_ = 0;
+  uint16_t wsl_device_id_ = 0;
+  uint32_t wsl_max_gfx_clk_mhz_ = 0;
+  uint32_t wsl_max_mem_clk_mhz_ = 0;
+  uint64_t wsl_vram_total_bytes_ = 0;
+  uint32_t wsl_luid_low_ = 0;
+  int32_t wsl_luid_high_ = 0;
+  bool wsl_luid_valid_ = false;
 };
 
 int DiscoverKFDNodes(std::map<uint64_t, std::shared_ptr<KFDNode>>* nodes);
