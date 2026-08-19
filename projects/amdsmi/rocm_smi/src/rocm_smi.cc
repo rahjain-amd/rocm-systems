@@ -4010,6 +4010,17 @@ rsmi_status_t rsmi_dev_current_socket_power_get(uint32_t dv_ind, uint64_t* socke
     LOG_ERROR(ss);
     return RSMI_STATUS_INVALID_ARGS;
   }
+  // WSL2: there is no hwmon PPT sensor. The DXG D3DKMTQueryAdapterInfo perf-data
+  // path exposes a "Power" field, but it is documented as tenths-of-a-percentage
+  // (not watts) and reads 0 on this driver, so there is no watts source. Return
+  // a clean NOT_SUPPORTED so the CLI shows N/A rather than a fabricated value.
+  if (amd::smi::is_wsl()) {
+    ss << __PRETTY_FUNCTION__
+       << " | WSL2: socket power (watts) unavailable via DXG perf-data; N/A";
+    LOG_INFO(ss);
+    return RSMI_STATUS_NOT_SUPPORTED;
+  }
+
   CHK_SUPPORT_SUBVAR_ONLY(socket_power, sensor_ind)
   DEVICE_MUTEX
 
