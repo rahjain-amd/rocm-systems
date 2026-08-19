@@ -3716,6 +3716,25 @@ rsmi_status_t rsmi_dev_fan_speed_get(uint32_t dv_ind, uint32_t sensor_ind, int64
 
   ++sensor_ind;  // fan sysfs files have 1-based indices
 
+  // WSL2: no hwmon pwm. Derive the PWM-style fan speed (0..RSMI_MAX_FAN_SPEED)
+  // from the DXG perf-data current/max fan rpm. A zero-RPM idle-stop fan is a
+  // legitimate 0 reading (not N/A) when the adapter advertises a fan.
+  if (amd::smi::is_wsl()) {
+    if (speed == nullptr) return RSMI_STATUS_INVALID_ARGS;
+    GET_DEV_AND_KFDNODE_FROM_INDX
+    if (!kfd_node->is_wsl_node()) return RSMI_STATUS_NOT_SUPPORTED;
+    amd::smi::DxgSensors sensors;
+    if (!kfd_node->wsl_query_sensors(&sensors) || !sensors.fan_valid || !sensors.fan_max_valid ||
+        sensors.fan_max_rpm == 0) {
+      return RSMI_STATUS_NOT_SUPPORTED;
+    }
+    uint64_t pwm = (static_cast<uint64_t>(sensors.fan_rpm) * RSMI_MAX_FAN_SPEED) /
+                   sensors.fan_max_rpm;
+    if (pwm > RSMI_MAX_FAN_SPEED) pwm = RSMI_MAX_FAN_SPEED;
+    *speed = static_cast<int64_t>(pwm);
+    return RSMI_STATUS_SUCCESS;
+  }
+
   CHK_SUPPORT_SUBVAR_ONLY(speed, sensor_ind)
 
   DEVICE_MUTEX
@@ -3745,6 +3764,20 @@ rsmi_status_t rsmi_dev_fan_rpms_get(uint32_t dv_ind, uint32_t sensor_ind, int64_
   LOG_TRACE(ss);
 
   ++sensor_ind;  // fan sysfs files have 1-based indices
+
+  // WSL2: source fan rpm from the DXG perf-data path (0 is a legitimate
+  // zero-RPM idle-stop reading when the adapter advertises a fan).
+  if (amd::smi::is_wsl()) {
+    if (speed == nullptr) return RSMI_STATUS_INVALID_ARGS;
+    GET_DEV_AND_KFDNODE_FROM_INDX
+    if (!kfd_node->is_wsl_node()) return RSMI_STATUS_NOT_SUPPORTED;
+    amd::smi::DxgSensors sensors;
+    if (!kfd_node->wsl_query_sensors(&sensors) || !sensors.fan_valid) {
+      return RSMI_STATUS_NOT_SUPPORTED;
+    }
+    *speed = static_cast<int64_t>(sensors.fan_rpm);
+    return RSMI_STATUS_SUCCESS;
+  }
 
   CHK_SUPPORT_SUBVAR_ONLY(speed, sensor_ind)
 
@@ -3874,6 +3907,22 @@ rsmi_status_t rsmi_dev_fan_speed_max_get(uint32_t dv_ind, uint32_t sensor_ind,
   ss << __PRETTY_FUNCTION__ << "| ======= start =======";
   LOG_TRACE(ss);
   ++sensor_ind;  // fan sysfs files have 1-based indices
+
+  // WSL2: the PWM-style max fan speed is the standard RSMI_MAX_FAN_SPEED (255);
+  // the physical max rpm is exposed separately via DXG _CAPS.MaxFanRPM. Only
+  // report the max when the adapter actually advertises a fan.
+  if (amd::smi::is_wsl()) {
+    if (max_speed == nullptr) return RSMI_STATUS_INVALID_ARGS;
+    GET_DEV_AND_KFDNODE_FROM_INDX
+    if (!kfd_node->is_wsl_node()) return RSMI_STATUS_NOT_SUPPORTED;
+    amd::smi::DxgSensors sensors;
+    if (!kfd_node->wsl_query_sensors(&sensors) || !sensors.fan_max_valid) {
+      return RSMI_STATUS_NOT_SUPPORTED;
+    }
+    *max_speed = RSMI_MAX_FAN_SPEED;
+    return RSMI_STATUS_SUCCESS;
+  }
+
   CHK_SUPPORT_SUBVAR_ONLY(max_speed, sensor_ind)
   DEVICE_MUTEX
 
