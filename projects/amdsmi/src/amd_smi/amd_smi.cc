@@ -4987,9 +4987,12 @@ amdsmi_status_t amdsmi_get_gpu_activity(amdsmi_processor_handle processor_handle
   amdsmi_status_t status;
 
   // WSL2: no gpu_metrics blob. Derive gfx activity from the DXG D3DKMT engine
-  // statistics via rsmi_dev_busy_percent_get. Memory-controller (umc) and
-  // multimedia (mm) activity are not exposed by the DXG path -> report N/A
-  // (UINT16_MAX) so the CLI does not print a misleading 0%.
+  // statistics via rsmi_dev_busy_percent_get. Memory-controller (umc) activity
+  // has no source on WSL: dxgkrnl exposes no UMC/memory scheduling engine node
+  // (D3DKMTQueryStatistics) and the perf-data MemoryBandwidth counter reads 0
+  // (D3DKMT_ADAPTER_PERFDATA), so a memory-activity % cannot be derived. Both
+  // umc and multimedia (mm) activity are therefore reported as N/A (UINT16_MAX)
+  // rather than a misleading 0% (P2.5).
   if (amd::smi::is_wsl()) {
     uint32_t busy = 0;
     uint32_t gpu_index = gpu_device->get_gpu_id();
