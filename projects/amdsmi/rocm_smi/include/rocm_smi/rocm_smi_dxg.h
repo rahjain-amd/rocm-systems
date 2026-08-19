@@ -110,6 +110,26 @@ struct DxgSensors {
   bool mem_activity_valid = false;
 };
 
+// P3: one GPU-using process as seen through the DXG per-process statistics
+// path (D3DKMTEnumProcesses + D3DKMTQueryStatistics PROCESS_SEGMENT /
+// PROCESS_NODE). This is the WSL2 analogue of a /sys/class/kfd/kfd/proc/<pid>
+// entry: KFD proc accounting is absent on WSL so per-process VRAM and engine
+// time are sourced from the paravirtualized DXG stack instead. Each numeric
+// field carries a validity flag so callers report clean N/A where dxgkrnl
+// does not populate a value.
+struct DxgProcInfo {
+  uint32_t pid = 0;             // Linux vpid (dxgkrnl EnumProcesses buffer entry)
+  std::string name;            // /proc/<pid>/comm (may be empty if process exited)
+  uint64_t vram_bytes = 0;      // sum of BytesCommitted over local (VRAM) segments
+  bool vram_valid = false;
+  // Cumulative busiest-engine running time for this process, in nanoseconds
+  // (dxgkrnl reports microseconds; converted here to match the amdsmi engine
+  // usage ABI which is expressed in ns). This is a monotonically increasing
+  // counter, not an instantaneous %.
+  uint64_t gfx_running_ns = 0;
+  bool gfx_valid = false;
+};
+
 // Returns true when running under WSL2, where /dev/dxg is present and the KFD
 // sysfs topology is absent. Used to gate all DXG-sourced enumeration so native
 // Linux behavior is completely unchanged.
@@ -141,6 +161,20 @@ bool DxgQueryLiveStats(uint32_t luid_low, int32_t luid_high, bool luid_valid,
 // native Linux (returns false because libdxcore.so is absent).
 bool DxgQuerySensors(uint32_t luid_low, int32_t luid_high, bool luid_valid,
                      DxgSensors* out);
+
+// P3: enumerates the GPU-using processes for the adapter matching the given
+// LUID and samples per-process VRAM + engine time, via libdxcore.so's
+// D3DKMTEnumProcesses + D3DKMTQueryStatistics (PROCESS_SEGMENT / PROCESS_NODE)
+// ABI. On WSL, D3DKMTEnumProcesses returns the Linux vpids of every process
+// holding the adapter open; each is then queried for its committed VRAM (summed
+// over local/non-aperture segments) and its busiest-engine cumulative running
+// time. Falls back to the first enumerated adapter when the LUID is unknown
+// (correct for single-GPU WSL). Processes that hold no GPU allocations return a
+// clean failure from dxgkrnl and are skipped rather than reported as zero rows.
+// Returns true on success (out populated, possibly empty). Safe to call on
+// native Linux (returns false because libdxcore.so is absent).
+bool DxgQueryProcessList(uint32_t luid_low, int32_t luid_high, bool luid_valid,
+                         std::vector<DxgProcInfo>* out);
 
 }  // namespace amd::smi
 

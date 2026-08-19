@@ -51,6 +51,7 @@ extern "C" {
 #include "amd_smi/impl/amd_smi_common.h"
 #include "amd_smi/impl/amd_smi_utils.h"
 #include "amd_smi/impl/fdinfo.h"
+#include "rocm_smi/rocm_smi_dxg.h"
 #include "rocm_smi/rocm_smi_kfd.h"
 #include "rocm_smi/rocm_smi_logger.h"
 #include "rocm_smi/rocm_smi_utils.h"
@@ -202,6 +203,34 @@ static const std::chrono::milliseconds kComputeProcessCacheDuration =
 
 int32_t AMDSmiGPUDevice::get_compute_process_list_impl(
     GPUComputeProcessList_t& compute_process_list, ComputeProcessListType_t list_type) {
+  // WSL2: KFD proc accounting (/sys/class/kfd/kfd/proc) is absent, so the rsmi
+  // path below finds nothing. Source the per-process list from the DXG stack
+  // instead (D3DKMTEnumProcesses + D3DKMTQueryStatistics PROCESS_SEGMENT/NODE).
+  // Single-GPU WSL is the common case, so an unknown LUID falls back to the
+  // first adapter inside DxgQueryProcessList. Native Linux is unaffected
+  // (is_wsl() is false there).
+  if (is_wsl()) {
+    compute_process_list.clear();
+    std::vector<DxgProcInfo> dxg_procs;
+    if (DxgQueryProcessList(0, 0, false, &dxg_procs)) {
+      for (const auto& p : dxg_procs) {
+        amdsmi_proc_info_t info{};
+        info.pid = static_cast<amdsmi_process_handle_t>(p.pid);
+        // /proc/<pid>/comm; leave the ABI's empty string if the process exited.
+        std::strncpy(info.name, p.name.c_str(), AMDSMI_MAX_STRING_LENGTH - 1);
+        if (p.vram_valid) {
+          info.mem = p.vram_bytes;
+          info.memory_usage.vram_mem = p.vram_bytes;
+        }
+        if (p.gfx_valid) {
+          info.engine_usage.gfx = p.gfx_running_ns;
+        }
+        compute_process_list[info.pid] = info;
+      }
+    }
+    return rsmi_status_t::RSMI_STATUS_SUCCESS;
+  }
+
   ComputeProcessCache* cache_ptr = nullptr;
   {
     std::lock_guard<std::mutex> lock(compute_process_list_mutex);
