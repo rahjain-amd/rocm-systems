@@ -348,6 +348,79 @@ static_assert(offsetof(DXG_QUERYSTATISTICS, Query) == 800, "Query offset");
 using fn_enum2 = int32_t (*)(DXG_ENUMADAPTERS2*);
 using fn_qs = int32_t (*)(DXG_QUERYSTATISTICS*);
 
+// ---------------------------------------------------------------------------
+// P2: D3DKMTQueryAdapterInfo perf-data ABI (public WDDM telemetry).
+//
+// Layouts hand-rolled to the fixed x64 ABI that libdxcore.so on WSL expects
+// (see PAL .../experimentalWdk/subsystem/libdxg/d3dkmthk.h: D3DKMT_NODE_PERFDATA
+// ~L2026, D3DKMT_ADAPTER_PERFDATA ~L2043, D3DKMT_ADAPTER_PERFDATACAPS ~L2057,
+// D3DKMT_QUERYADAPTERINFO ~L2246). On non-Windows the header forces 8-byte
+// alignment (D3DKMT_ALIGN64) and 64-bit pointer unions, reproduced here.
+// static_asserts pin the sizes so any layout drift fails the build rather than
+// reading garbage from the kernel.
+// ---------------------------------------------------------------------------
+enum {
+  kQaiNodePerfData = 61,      // KMTQAITYPE_NODEPERFDATA
+  kQaiAdapterPerfData = 62,   // KMTQAITYPE_ADAPTERPERFDATA
+  kQaiAdapterPerfDataCaps = 63,  // KMTQAITYPE_ADAPTERPERFDATA_CAPS
+};
+
+struct DXG_QUERYADAPTERINFO {
+  uint32_t hAdapter;             // off 0
+  uint32_t Type;                 // off 4 (KMTQUERYADAPTERINFOTYPE enum -> 4 bytes)
+  uint64_t pPrivateDriverData;   // off 8 (8-byte aligned pointer union on LP64)
+  uint32_t PrivateDriverDataSize;  // off 16
+  uint32_t _pad;                 // off 20 -> size 24
+};
+static_assert(sizeof(DXG_QUERYADAPTERINFO) == 24, "D3DKMT_QUERYADAPTERINFO layout drift");
+static_assert(offsetof(DXG_QUERYADAPTERINFO, pPrivateDriverData) == 8, "QAI ptr offset");
+
+struct DXG_ADAPTER_PERFDATA {
+  uint32_t PhysicalAdapterIndex;  // off 0
+  uint32_t _pad0;                 // off 4
+  uint64_t MemoryFrequency;       // off 8  (Hz)
+  uint64_t MaxMemoryFrequency;    // off 16 (Hz)
+  uint64_t MaxMemoryFrequencyOC;  // off 24
+  uint64_t MemoryBandwidth;       // off 32 (bytes)
+  uint64_t PCIEBandwidth;         // off 40
+  uint32_t FanRPM;                // off 48
+  uint32_t Power;                 // off 52 (tenths of a percentage -- NOT watts)
+  uint32_t Temperature;           // off 56 (deci-Celsius, 1 = 0.1C)
+  uint8_t PowerStateOverride;     // off 60
+  uint8_t _pad1[3];               // -> size 64
+};
+static_assert(sizeof(DXG_ADAPTER_PERFDATA) == 64, "D3DKMT_ADAPTER_PERFDATA layout drift");
+static_assert(offsetof(DXG_ADAPTER_PERFDATA, Temperature) == 56, "APD temp offset");
+
+struct DXG_ADAPTER_PERFDATACAPS {
+  uint32_t PhysicalAdapterIndex;  // off 0
+  uint32_t _pad0;                 // off 4
+  uint64_t MaxMemoryBandwidth;    // off 8
+  uint64_t MaxPCIEBandwidth;      // off 16
+  uint32_t MaxFanRPM;             // off 24
+  uint32_t TemperatureMax;        // off 28 (deci-Celsius)
+  uint32_t TemperatureWarning;    // off 32 (deci-Celsius)
+  uint32_t _pad1;                 // -> size 40
+};
+static_assert(sizeof(DXG_ADAPTER_PERFDATACAPS) == 40, "D3DKMT_ADAPTER_PERFDATACAPS layout drift");
+
+struct DXG_NODE_PERFDATA {
+  uint32_t NodeOrdinal;           // off 0  (in)
+  uint32_t PhysicalAdapterIndex;  // off 4  (in)
+  uint64_t Frequency;             // off 8  (Hz, out -- live engine clock)
+  uint64_t MaxFrequency;          // off 16 (Hz)
+  uint64_t MaxFrequencyOC;        // off 24
+  uint32_t Voltage;               // off 32 (mV)
+  uint32_t VoltageMax;            // off 36
+  uint32_t VoltageMaxOC;          // off 40
+  uint32_t _pad;                  // off 44
+  uint64_t MaxTransitionLatency;  // off 48 -> size 56
+};
+static_assert(sizeof(DXG_NODE_PERFDATA) == 56, "D3DKMT_NODE_PERFDATA layout drift");
+static_assert(offsetof(DXG_NODE_PERFDATA, Frequency) == 8, "NPD freq offset");
+
+using fn_qai = int32_t (*)(const DXG_QUERYADAPTERINFO*);
+
 int64_t steady_usec() {
   return std::chrono::duration_cast<std::chrono::microseconds>(
              std::chrono::steady_clock::now().time_since_epoch())
@@ -526,6 +599,166 @@ bool DxgQueryLiveStats(uint32_t luid_low, int32_t luid_high, bool luid_valid, ui
   // The dlopen handle is intentionally leaked (kept resident) to match the
   // thunk-loader lifetime policy used by DxgEnumerateGpuNodes above.
   return out->vram_used_valid || out->gfx_activity_valid;
+}
+
+bool DxgQuerySensors(uint32_t luid_low, int32_t luid_high, bool luid_valid, DxgSensors* out) {
+  std::ostringstream ss;
+  if (out == nullptr) {
+    return false;
+  }
+  *out = DxgSensors{};
+
+  void* h = ::dlopen("libdxcore.so", RTLD_NOW | RTLD_GLOBAL);
+  if (h == nullptr) {
+    ss << __PRETTY_FUNCTION__ << " | dlopen(libdxcore.so) failed: " << dlerror();
+    LOG_INFO(ss);
+    return false;
+  }
+
+  auto Enum2 = reinterpret_cast<fn_enum2>(dlsym(h, "D3DKMTEnumAdapters2"));
+  auto QueryAdapterInfo = reinterpret_cast<fn_qai>(dlsym(h, "D3DKMTQueryAdapterInfo"));
+  if (!Enum2 || !QueryAdapterInfo) {
+    ss << __PRETTY_FUNCTION__ << " | D3DKMT symbols missing in libdxcore.so";
+    LOG_ERROR(ss);
+    return false;
+  }
+
+  DXG_ENUMADAPTERS2 ea;
+  memset(&ea, 0, sizeof(ea));
+  if (Enum2(&ea) != 0 || ea.NumAdapters == 0) {
+    ss << __PRETTY_FUNCTION__ << " | D3DKMTEnumAdapters2 (count) failed / no adapters";
+    LOG_ERROR(ss);
+    return false;
+  }
+  const uint32_t kMaxAdapters = 16;
+  if (ea.NumAdapters > kMaxAdapters) {
+    ea.NumAdapters = kMaxAdapters;
+  }
+  DXG_ADAPTERINFO adapters[kMaxAdapters];
+  memset(adapters, 0, sizeof(adapters));
+  ea.pAdapters = adapters;
+  if (Enum2(&ea) != 0 || ea.NumAdapters == 0) {
+    ss << __PRETTY_FUNCTION__ << " | D3DKMTEnumAdapters2 (fill) failed";
+    LOG_ERROR(ss);
+    return false;
+  }
+
+  // Pick the adapter matching the hsaKmt LUID; else fall back to the first.
+  uint32_t h_adapter = adapters[0].hAdapter;
+  if (luid_valid) {
+    for (uint32_t a = 0; a < ea.NumAdapters; ++a) {
+      if (adapters[a].AdapterLuid.LowPart == luid_low &&
+          adapters[a].AdapterLuid.HighPart == luid_high) {
+        h_adapter = adapters[a].hAdapter;
+        break;
+      }
+    }
+  }
+
+  // --- Capabilities: max fan rpm, max/warning temperature (deci-C -> milli-C).
+  {
+    DXG_ADAPTER_PERFDATACAPS caps;
+    memset(&caps, 0, sizeof(caps));
+    DXG_QUERYADAPTERINFO q;
+    memset(&q, 0, sizeof(q));
+    q.hAdapter = h_adapter;
+    q.Type = kQaiAdapterPerfDataCaps;
+    q.pPrivateDriverData = reinterpret_cast<uint64_t>(&caps);
+    q.PrivateDriverDataSize = static_cast<uint32_t>(sizeof(caps));
+    if (QueryAdapterInfo(&q) == 0) {
+      if (caps.MaxFanRPM != 0) {
+        out->fan_max_rpm = caps.MaxFanRPM;
+        out->fan_max_valid = true;
+      }
+      if (caps.TemperatureMax != 0) {
+        out->temp_max_millic = static_cast<int64_t>(caps.TemperatureMax) * 100;
+        out->temp_max_valid = true;
+      }
+      if (caps.TemperatureWarning != 0) {
+        out->temp_warn_millic = static_cast<int64_t>(caps.TemperatureWarning) * 100;
+        out->temp_warn_valid = true;
+      }
+    }
+  }
+
+  // --- Adapter perf data: memory clock, temperature, fan rpm. (Power is a
+  // percentage on this ABI, not watts, and reads 0, so it stays N/A.)
+  {
+    DXG_ADAPTER_PERFDATA pd;
+    memset(&pd, 0, sizeof(pd));
+    DXG_QUERYADAPTERINFO q;
+    memset(&q, 0, sizeof(q));
+    q.hAdapter = h_adapter;
+    q.Type = kQaiAdapterPerfData;
+    q.pPrivateDriverData = reinterpret_cast<uint64_t>(&pd);
+    q.PrivateDriverDataSize = static_cast<uint32_t>(sizeof(pd));
+    if (QueryAdapterInfo(&q) == 0) {
+      // Temperature: driver reports deci-Celsius. A plausible reading is > 0;
+      // treat exactly 0 as "not populated" to avoid claiming 0C.
+      if (pd.Temperature != 0) {
+        out->temp_current_millic = static_cast<int64_t>(pd.Temperature) * 100;
+        out->temp_current_valid = true;
+      }
+      if (pd.MemoryFrequency != 0) {
+        out->mem_clk_mhz = static_cast<uint32_t>(pd.MemoryFrequency / 1000000ULL);
+        out->mem_clk_valid = true;
+      }
+      // Fan rpm is a valid reading even when 0 (zero-RPM idle stop), but only
+      // report it as valid when the adapter advertises a fan (MaxFanRPM > 0).
+      if (out->fan_max_valid) {
+        out->fan_rpm = pd.FanRPM;
+        out->fan_valid = true;
+      }
+    }
+  }
+
+  // --- Node perf data: live engine clocks. Take the maximum current Frequency
+  // across engine nodes as the reported gfx/SCLK (matches how a single GPU
+  // clock figure is surfaced; different WDDM engines share the gfx domain).
+  {
+    const uint32_t kMaxNodes = 16;
+    uint64_t best_freq_hz = 0;
+    bool any = false;
+    for (uint32_t n = 0; n < kMaxNodes; ++n) {
+      DXG_NODE_PERFDATA np;
+      memset(&np, 0, sizeof(np));
+      np.NodeOrdinal = n;
+      DXG_QUERYADAPTERINFO q;
+      memset(&q, 0, sizeof(q));
+      q.hAdapter = h_adapter;
+      q.Type = kQaiNodePerfData;
+      q.pPrivateDriverData = reinterpret_cast<uint64_t>(&np);
+      q.PrivateDriverDataSize = static_cast<uint32_t>(sizeof(np));
+      if (QueryAdapterInfo(&q) != 0) {
+        continue;
+      }
+      // A node that reports neither a current nor a max frequency is absent.
+      if (np.Frequency == 0 && np.MaxFrequency == 0) {
+        continue;
+      }
+      any = true;
+      if (np.Frequency > best_freq_hz) {
+        best_freq_hz = np.Frequency;
+      }
+    }
+    if (any) {
+      out->gfx_clk_mhz = static_cast<uint32_t>(best_freq_hz / 1000000ULL);
+      out->gfx_clk_valid = true;
+    }
+  }
+
+  ss << __PRETTY_FUNCTION__ << " | gfx_clk=" << out->gfx_clk_mhz << "MHz("
+     << (out->gfx_clk_valid ? "valid" : "N/A") << ") mem_clk=" << out->mem_clk_mhz << "MHz("
+     << (out->mem_clk_valid ? "valid" : "N/A") << ") temp=" << (out->temp_current_millic / 1000)
+     << "C(" << (out->temp_current_valid ? "valid" : "N/A") << ") fan=" << out->fan_rpm << "rpm("
+     << (out->fan_valid ? "valid" : "N/A") << ") power="
+     << (out->power_valid ? "valid" : "N/A") << " mem_activity="
+     << (out->mem_activity_valid ? "valid" : "N/A");
+  LOG_INFO(ss);
+
+  // dlopen handle intentionally leaked (kept resident), matching the policy in
+  // DxgEnumerateGpuNodes / DxgQueryLiveStats above.
+  return out->gfx_clk_valid || out->mem_clk_valid || out->temp_current_valid || out->fan_valid;
 }
 
 }  // namespace amd::smi

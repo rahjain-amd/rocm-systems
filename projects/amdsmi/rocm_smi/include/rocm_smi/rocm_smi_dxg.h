@@ -70,6 +70,46 @@ struct DxgLiveStats {
   bool gfx_activity_valid = false;
 };
 
+// P2: live sensor/telemetry snapshot sourced from the public WDDM
+// D3DKMTQueryAdapterInfo perf-data path (KMTQAITYPE_ADAPTERPERFDATA /
+// _CAPS / NODEPERFDATA) exposed through libdxcore.so. This is the same
+// telemetry Windows Task Manager reads; it does NOT require the AMD-private
+// D3DKMTEscape payload headers (cwddedi.h) which are unavailable on WSL.
+// Each field carries an explicit valid flag so callers report clean N/A for
+// anything the WSL dxgkrnl driver does not populate.
+struct DxgSensors {
+  // Live graphics/engine clock: max current Frequency across engine nodes
+  // (D3DKMT_NODE_PERFDATA.Frequency), in MHz.
+  uint32_t gfx_clk_mhz = 0;
+  bool gfx_clk_valid = false;
+  // Live memory clock: D3DKMT_ADAPTER_PERFDATA.MemoryFrequency, in MHz.
+  uint32_t mem_clk_mhz = 0;
+  bool mem_clk_valid = false;
+  // Current edge/junction temperature: D3DKMT_ADAPTER_PERFDATA.Temperature is
+  // in deci-Celsius (1 = 0.1C); stored here in millidegrees C to match the
+  // rsmi temperature ABI.
+  int64_t temp_current_millic = 0;
+  bool temp_current_valid = false;
+  int64_t temp_max_millic = 0;      // _CAPS.TemperatureMax (deci-C -> milli-C)
+  bool temp_max_valid = false;
+  int64_t temp_warn_millic = 0;     // _CAPS.TemperatureWarning (deci-C -> milli-C)
+  bool temp_warn_valid = false;
+  // Fan: D3DKMT_ADAPTER_PERFDATA.FanRPM and _CAPS.MaxFanRPM.
+  uint32_t fan_rpm = 0;
+  bool fan_valid = false;
+  uint32_t fan_max_rpm = 0;
+  bool fan_max_valid = false;
+  // Power: D3DKMT_ADAPTER_PERFDATA.Power is documented as "tenths of a
+  // percentage", not watts, and reads 0 on this WSL driver. There is no
+  // watts source on the public path, so power stays invalid (clean N/A).
+  uint64_t power_uw = 0;
+  bool power_valid = false;
+  // Memory activity %: the WDDM perf-data path exposes no UMC/memory-engine
+  // utilization counter (MemoryBandwidth reads 0), so this stays invalid.
+  uint32_t mem_activity_pct = 0;
+  bool mem_activity_valid = false;
+};
+
 // Returns true when running under WSL2, where /dev/dxg is present and the KFD
 // sysfs topology is absent. Used to gate all DXG-sourced enumeration so native
 // Linux behavior is completely unchanged.
@@ -92,6 +132,15 @@ bool DxgEnumerateGpuNodes(std::vector<DxgNodeInfo>* out);
 // Linux (returns false because libdxcore.so is absent).
 bool DxgQueryLiveStats(uint32_t luid_low, int32_t luid_high, bool luid_valid,
                        uint32_t sample_ms, DxgLiveStats* out);
+
+// Samples the live sensor/telemetry suite (clocks, temperature, fan) for the
+// adapter matching the given LUID via libdxcore.so's D3DKMTQueryAdapterInfo
+// perf-data types. Falls back to the first enumerated adapter when the LUID is
+// unknown (correct for single-GPU WSL). Returns true if at least one field was
+// populated; per-field validity is carried in DxgSensors. Safe to call on
+// native Linux (returns false because libdxcore.so is absent).
+bool DxgQuerySensors(uint32_t luid_low, int32_t luid_high, bool luid_valid,
+                     DxgSensors* out);
 
 }  // namespace amd::smi
 

@@ -2073,31 +2073,57 @@ rsmi_status_t rsmi_dev_gpu_clk_freq_get(uint32_t dv_ind, rsmi_clk_type_t clk_typ
   DEVICE_MUTEX
 
   // WSL2: the amdgpu pp_dpm_* sysfs used by get_frequencies() is absent. Source
-  // the clock from the DXG topology instead. Only gfx (SYS) and memory (MEM)
-  // clocks are exposed by the DXG topology, and only as maxima -- report that
-  // single value as the (sole, current) supported level. Other domains return
+  // the clock from the DXG stack instead. The topology gives the maximum for
+  // gfx (SYS) and memory (MEM); P2 adds the *live* current frequency from the
+  // D3DKMTQueryAdapterInfo perf-data path. When a live value is available it is
+  // reported as the current level (index 0) with the max exposed as a second
+  // level; otherwise the max is the sole (current) level. Other domains return
   // NOT_SUPPORTED so callers cleanly show N/A rather than an error.
   if (amd::smi::is_wsl()) {
     GET_DEV_AND_KFDNODE_FROM_INDX
     if (!kfd_node->is_wsl_node()) {
       return RSMI_STATUS_NOT_SUPPORTED;
     }
-    uint32_t mhz = 0;
+    uint32_t max_mhz = 0;
     if (clk_type == RSMI_CLK_TYPE_SYS) {
-      mhz = kfd_node->wsl_max_gfx_clk_mhz();
+      max_mhz = kfd_node->wsl_max_gfx_clk_mhz();
     } else if (clk_type == RSMI_CLK_TYPE_MEM) {
-      mhz = kfd_node->wsl_max_mem_clk_mhz();
+      max_mhz = kfd_node->wsl_max_mem_clk_mhz();
     } else {
       return RSMI_STATUS_NOT_SUPPORTED;
     }
-    if (mhz == 0) {
+
+    // Live current clock (best-effort). Non-fatal if the query fails: we then
+    // fall back to reporting the max as the current level.
+    uint32_t cur_mhz = 0;
+    amd::smi::DxgSensors sensors;
+    if (kfd_node->wsl_query_sensors(&sensors)) {
+      if (clk_type == RSMI_CLK_TYPE_SYS && sensors.gfx_clk_valid) {
+        cur_mhz = sensors.gfx_clk_mhz;
+      } else if (clk_type == RSMI_CLK_TYPE_MEM && sensors.mem_clk_valid) {
+        cur_mhz = sensors.mem_clk_mhz;
+      }
+    }
+
+    if (max_mhz == 0 && cur_mhz == 0) {
       return RSMI_STATUS_NOT_SUPPORTED;
     }
     memset(f, 0, sizeof(rsmi_frequencies_t));
-    f->num_supported = 1;
-    f->current = 0;  // the single level is the current one (max-only on WSL)
     f->has_deep_sleep = false;
-    f->frequency[0] = static_cast<uint64_t>(mhz) * 1000000ULL;  // MHz -> Hz
+    if (cur_mhz != 0) {
+      f->frequency[0] = static_cast<uint64_t>(cur_mhz) * 1000000ULL;  // live current
+      f->current = 0;
+      if (max_mhz != 0 && max_mhz != cur_mhz) {
+        f->frequency[1] = static_cast<uint64_t>(max_mhz) * 1000000ULL;
+        f->num_supported = 2;
+      } else {
+        f->num_supported = 1;
+      }
+    } else {
+      f->frequency[0] = static_cast<uint64_t>(max_mhz) * 1000000ULL;  // max-only
+      f->current = 0;
+      f->num_supported = 1;
+    }
     return RSMI_STATUS_SUCCESS;
   }
 

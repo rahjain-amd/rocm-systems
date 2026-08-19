@@ -1128,6 +1128,13 @@ bool KFDNode::wsl_query_live_stats(uint32_t sample_ms, DxgLiveStats* out) const 
   return DxgQueryLiveStats(wsl_luid_low_, wsl_luid_high_, wsl_luid_valid_, sample_ms, out);
 }
 
+bool KFDNode::wsl_query_sensors(DxgSensors* out) const {
+  if (out == nullptr || !is_wsl_node_) {
+    return false;
+  }
+  return DxgQuerySensors(wsl_luid_low_, wsl_luid_high_, wsl_luid_valid_, out);
+}
+
 int KFDNode::ReadProperties(void) {
   int ret;
 
