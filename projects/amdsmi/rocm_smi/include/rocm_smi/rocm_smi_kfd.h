@@ -95,6 +95,10 @@ class KFDNode {
   // Samples live VRAM-used + engine utilization for this node's adapter via the
   // DXG D3DKMT path. Returns true if at least one field is valid.
   bool wsl_query_live_stats(uint32_t sample_ms, DxgLiveStats* out) const;
+  // P2: samples the live sensor suite (clocks, temperature, fan) for this
+  // node's adapter via the DXG D3DKMTQueryAdapterInfo perf-data path. Returns
+  // true if at least one field is valid.
+  bool wsl_query_sensors(DxgSensors* out) const;
 
  private:
   uint32_t node_indx_;

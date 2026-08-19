@@ -5033,10 +5033,10 @@ amdsmi_status_t amdsmi_get_clock_info(amdsmi_processor_handle processor_handle,
   amdsmi_status_t status;
 
   // WSL2: the gpu_metrics blob and amdgpu clock ranges (sysfs) are unavailable.
-  // Source the clock from the DXG topology via rsmi_dev_gpu_clk_freq_get, which
-  // reports the max gfx/mem clock as the single (current) supported level.
-  // Only GFX and MEM are exposed by the DXG topology; the CLI shows N/A for the
-  // rest. These are MAX values, not live -- reported as both clk and max_clk.
+  // Source the clock from the DXG stack via rsmi_dev_gpu_clk_freq_get, which on
+  // WSL reports the *live* current gfx/mem clock at the current index and the
+  // hardware maximum as an additional level (P2). Only GFX and MEM are exposed;
+  // the CLI shows N/A for the rest.
   if (amd::smi::is_wsl()) {
     rsmi_clk_type_t rsmi_clk;
     if (clk_type == AMDSMI_CLK_TYPE_GFX) {
@@ -5052,10 +5052,16 @@ amdsmi_status_t amdsmi_get_clock_info(amdsmi_processor_handle processor_handle,
     if (rs != RSMI_STATUS_SUCCESS) {
       return amd::smi::rsmi_to_amdsmi_status(rs);
     }
-    uint32_t idx = (freqs.current < freqs.num_supported) ? freqs.current : 0;
-    uint32_t mhz = static_cast<uint32_t>(freqs.frequency[idx] / 1000000ULL);
-    info->clk = mhz;      // best-effort "current" == max on WSL
-    info->max_clk = mhz;  // hardware maximum from DXG topology
+    uint32_t cur_idx = (freqs.current < freqs.num_supported) ? freqs.current : 0;
+    info->clk = static_cast<uint32_t>(freqs.frequency[cur_idx] / 1000000ULL);  // live current
+    // max_clk is the largest advertised level (the topology maximum).
+    uint64_t max_hz = 0;
+    for (uint32_t i = 0; i < freqs.num_supported && i < RSMI_MAX_NUM_FREQUENCIES; ++i) {
+      if (freqs.frequency[i] > max_hz) {
+        max_hz = freqs.frequency[i];
+      }
+    }
+    info->max_clk = static_cast<uint32_t>(max_hz / 1000000ULL);
     info->min_clk = 0;
     info->clk_deep_sleep = 0;
     info->clk_locked = 0;
