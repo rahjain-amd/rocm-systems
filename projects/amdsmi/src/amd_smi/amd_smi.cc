@@ -4155,6 +4155,18 @@ amdsmi_status_t amdsmi_get_gpu_metrics_info(amdsmi_processor_handle processor_ha
     if (rsmi_dev_busy_percent_get(gpu_index, &busy) == RSMI_STATUS_SUCCESS) {
       pgpu_metrics->average_gfx_activity = static_cast<uint16_t>(busy);
     }
+
+    // P2: live temperature from the DXG perf-data path. The single die reading
+    // is surfaced as both edge and hotspot (deci-C -> C); memory temperature
+    // has no source and stays N/A. gpu_metrics temperatures are in whole C.
+    int64_t temp_millic = 0;
+    if (rsmi_dev_temp_metric_get(gpu_index, RSMI_TEMP_TYPE_EDGE, RSMI_TEMP_CURRENT, &temp_millic) ==
+            RSMI_STATUS_SUCCESS &&
+        temp_millic > 0) {
+      uint16_t temp_c = static_cast<uint16_t>(temp_millic / 1000);
+      pgpu_metrics->temperature_edge = temp_c;
+      pgpu_metrics->temperature_hotspot = temp_c;
+    }
     return AMDSMI_STATUS_SUCCESS;
   }
 
