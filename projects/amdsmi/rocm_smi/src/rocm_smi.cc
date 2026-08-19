@@ -3409,6 +3409,43 @@ rsmi_status_t rsmi_dev_temp_metric_get(uint32_t dv_ind, uint32_t sensor_type,
   // Previously the mutex was acquired after those blocks, leaving them unprotected.
   DEVICE_MUTEX
 
+  // WSL2: the amdgpu hwmon temp*_input sysfs is absent. Source temperature from
+  // the DXG D3DKMTQueryAdapterInfo perf-data path. The driver exposes a single
+  // die temperature (mapped to EDGE and JUNCTION/hotspot) plus a max/warning
+  // level from the caps query; VRAM/memory temperature has no source -> N/A.
+  if (amd::smi::is_wsl()) {
+    if (temperature == nullptr) {
+      return RSMI_STATUS_INVALID_ARGS;
+    }
+    GET_DEV_AND_KFDNODE_FROM_INDX
+    if (!kfd_node->is_wsl_node()) {
+      return RSMI_STATUS_NOT_SUPPORTED;
+    }
+    // Only the edge and junction/hotspot sensors are backed by the single DXG
+    // temperature reading; other sensors (memory/HBM/board) are unavailable.
+    if (sensor_type != RSMI_TEMP_TYPE_EDGE && sensor_type != RSMI_TEMP_TYPE_JUNCTION) {
+      return RSMI_STATUS_NOT_SUPPORTED;
+    }
+    amd::smi::DxgSensors sensors;
+    if (!kfd_node->wsl_query_sensors(&sensors)) {
+      return RSMI_STATUS_NOT_SUPPORTED;
+    }
+    switch (metric) {
+      case RSMI_TEMP_CURRENT:
+        if (!sensors.temp_current_valid) return RSMI_STATUS_NOT_SUPPORTED;
+        *temperature = sensors.temp_current_millic;
+        return RSMI_STATUS_SUCCESS;
+      case RSMI_TEMP_MAX:
+      case RSMI_TEMP_CRITICAL:
+      case RSMI_TEMP_EMERGENCY:
+        if (!sensors.temp_max_valid) return RSMI_STATUS_NOT_SUPPORTED;
+        *temperature = sensors.temp_max_millic;
+        return RSMI_STATUS_SUCCESS;
+      default:
+        return RSMI_STATUS_NOT_SUPPORTED;
+    }
+  }
+
   // handle gpu board temp
   if (sensor_type >= RSMI_TEMP_TYPE_GPUBOARD_NODE_FIRST &&
       sensor_type <= RSMI_TEMP_TYPE_GPUBOARD_LAST) {
