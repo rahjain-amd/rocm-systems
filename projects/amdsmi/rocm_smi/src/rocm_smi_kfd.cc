@@ -490,6 +490,17 @@ int GetProcessInfo(rsmi_process_info_t* procs, uint32_t num_allocated, uint32_t*
 
   *num_procs_found = 0;
 
+  // On WSL2 the KFD sysfs (/sys/class/kfd) is absent: /dev/kfd does not exist
+  // and process/queue accounting lives in the paravirtualized DXG stack, not
+  // under kKFDProcPathRoot. Opening that path here fails with ENOENT and the
+  // perror below prints a cosmetic "Unable to open process directory" line on
+  // every bare `amd-smi` invocation. Skip the KFD proc scan on WSL and return
+  // a clean, empty process list; the DXG per-process path supplies data (P3).
+  // Native Linux behavior is unchanged (is_wsl() is false there).
+  if (is_wsl()) {
+    return 0;
+  }
+
   // In a PID namespace, KFD sysfs PIDs are not local; scan /proc instead.
   if (IsKfdPidNamespaced()) {
     return ScanProcForKfdPids(procs, num_allocated, num_procs_found);
