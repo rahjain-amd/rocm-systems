@@ -4302,6 +4302,13 @@ amdsmi_status_t amdsmi_get_gpu_metrics_info(amdsmi_processor_handle processor_ha
       pgpu_metrics->temperature_edge = temp_c;
       pgpu_metrics->temperature_hotspot = temp_c;
     }
+
+    // P2: live fan rpm from the DXG perf-data path (0 is a legitimate
+    // zero-RPM idle-stop reading when the adapter advertises a fan).
+    int64_t fan_rpm = 0;
+    if (rsmi_dev_fan_rpms_get(gpu_index, 0, &fan_rpm) == RSMI_STATUS_SUCCESS) {
+      pgpu_metrics->current_fan_speed = static_cast<uint16_t>(fan_rpm);
+    }
     return AMDSMI_STATUS_SUCCESS;
   }
 
