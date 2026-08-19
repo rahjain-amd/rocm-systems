@@ -345,8 +345,55 @@ static_assert(sizeof(DXG_QUERYSTATISTICS) == 0x328,
 static_assert(offsetof(DXG_QUERYSTATISTICS, QueryResult) == 24, "QueryResult offset");
 static_assert(offsetof(DXG_QUERYSTATISTICS, Query) == 800, "Query offset");
 
+// P3: per-process statistics result views over the same 776-byte QueryResult
+// union. Layouts hand-rolled from the WSL2-Linux-Kernel uapi d3dkmthk.h and the
+// Windows WDK D3DKMT_QUERYSTATISTICS_PROCESS_* structures.
+//   - PROCESS_SEGMENT: first field BytesCommitted (u64) is the process's VRAM
+//     footprint in that segment.
+//   - PROCESS_NODE: first field RunningTime (LARGE_INTEGER, microseconds) is the
+//     process's cumulative busy time on that engine node.
+enum {
+  kQsProcess = 1,
+  kQsProcessSegment = 4,
+  kQsProcessNode = 6,
+};
+
+struct QsProcSegmentInfo {
+  uint64_t BytesCommitted;   // process VRAM held in this segment (bytes)
+};
+
+struct QsProcNodeInfo {
+  int64_t RunningTime;       // cumulative engine running time (microseconds)
+};
+
+// struct d3dkmt_enumprocesses (user mode ABI): winluid + u64 buffer + u64 count.
+// The kernel fills buffer[] with the Linux vpid (u32) of each process that has
+// the adapter open (LX_DXENUMPROCESSES).
+struct DXG_ENUMPROCESSES {
+  DXG_LUID AdapterLuid;   // off 0
+  uint64_t pBuffer;       // off 8  (points to uint32_t[])
+  uint64_t BufferCount;   // off 16 (in: capacity; out: number written)
+};
+static_assert(sizeof(DXG_ENUMPROCESSES) == 24, "d3dkmt_enumprocesses layout drift");
+static_assert(offsetof(DXG_ENUMPROCESSES, BufferCount) == 16, "enumproc count offset");
+
 using fn_enum2 = int32_t (*)(DXG_ENUMADAPTERS2*);
 using fn_qs = int32_t (*)(DXG_QUERYSTATISTICS*);
+using fn_enumproc = int32_t (*)(DXG_ENUMPROCESSES*);
+
+// Read /proc/<pid>/comm into a short display name. Returns empty on failure
+// (e.g. the process already exited between enumeration and this read).
+std::string read_proc_comm(uint32_t pid) {
+  std::ostringstream path;
+  path << "/proc/" << pid << "/comm";
+  std::ifstream f(path.str());
+  if (!f.is_open()) {
+    return std::string();
+  }
+  std::string name;
+  std::getline(f, name);
+  return name;
+}
 
 // ---------------------------------------------------------------------------
 // P2: D3DKMTQueryAdapterInfo perf-data ABI (public WDDM telemetry).
@@ -759,6 +806,201 @@ bool DxgQuerySensors(uint32_t luid_low, int32_t luid_high, bool luid_valid, DxgS
   // dlopen handle intentionally leaked (kept resident), matching the policy in
   // DxgEnumerateGpuNodes / DxgQueryLiveStats above.
   return out->gfx_clk_valid || out->mem_clk_valid || out->temp_current_valid || out->fan_valid;
+}
+
+bool DxgQueryProcessList(uint32_t luid_low, int32_t luid_high, bool luid_valid,
+                         std::vector<DxgProcInfo>* out) {
+  std::ostringstream ss;
+  if (out == nullptr) {
+    return false;
+  }
+  out->clear();
+
+  void* h = ::dlopen("libdxcore.so", RTLD_NOW | RTLD_GLOBAL);
+  if (h == nullptr) {
+    ss << __PRETTY_FUNCTION__ << " | dlopen(libdxcore.so) failed: " << dlerror();
+    LOG_INFO(ss);
+    return false;
+  }
+
+  auto Enum2 = reinterpret_cast<fn_enum2>(dlsym(h, "D3DKMTEnumAdapters2"));
+  auto QueryStats = reinterpret_cast<fn_qs>(dlsym(h, "D3DKMTQueryStatistics"));
+  auto EnumProc = reinterpret_cast<fn_enumproc>(dlsym(h, "D3DKMTEnumProcesses"));
+  if (!Enum2 || !QueryStats || !EnumProc) {
+    ss << __PRETTY_FUNCTION__ << " | required D3DKMT symbols missing in libdxcore.so";
+    LOG_ERROR(ss);
+    return false;
+  }
+
+  DXG_ENUMADAPTERS2 ea;
+  memset(&ea, 0, sizeof(ea));
+  if (Enum2(&ea) != 0 || ea.NumAdapters == 0) {
+    ss << __PRETTY_FUNCTION__ << " | D3DKMTEnumAdapters2 (count) failed / no adapters";
+    LOG_ERROR(ss);
+    return false;
+  }
+  const uint32_t kMaxAdapters = 16;
+  if (ea.NumAdapters > kMaxAdapters) {
+    ea.NumAdapters = kMaxAdapters;
+  }
+  DXG_ADAPTERINFO adapters[kMaxAdapters];
+  memset(adapters, 0, sizeof(adapters));
+  ea.pAdapters = adapters;
+  if (Enum2(&ea) != 0 || ea.NumAdapters == 0) {
+    ss << __PRETTY_FUNCTION__ << " | D3DKMTEnumAdapters2 (fill) failed";
+    LOG_ERROR(ss);
+    return false;
+  }
+
+  // Pick the adapter matching the hsaKmt LUID; else fall back to the first.
+  DXG_LUID luid = adapters[0].AdapterLuid;
+  if (luid_valid) {
+    for (uint32_t a = 0; a < ea.NumAdapters; ++a) {
+      if (adapters[a].AdapterLuid.LowPart == luid_low &&
+          adapters[a].AdapterLuid.HighPart == luid_high) {
+        luid = adapters[a].AdapterLuid;
+        break;
+      }
+    }
+  }
+
+  // Adapter-level query: how many segments / nodes exist. Needed so we know how
+  // many per-process segment/node ids to sweep.
+  uint32_t nb_seg = 0;
+  uint32_t n_node = 0;
+  {
+    DXG_QUERYSTATISTICS q;
+    memset(&q, 0, sizeof(q));
+    q.Type = kQsAdapter;
+    q.AdapterLuid = luid;
+    if (QueryStats(&q) == 0) {
+      nb_seg = q.QueryResult.Adapter.NbSegments;
+      n_node = q.QueryResult.Adapter.NodeCount;
+    }
+  }
+
+  // Determine which segment ids are local VRAM (non-aperture) via the global
+  // segment query; per-process VRAM is summed only over these, matching the
+  // global VRAM-used computation in DxgQueryLiveStats.
+  const uint32_t kMaxSeg = 32;
+  if (nb_seg > kMaxSeg) {
+    nb_seg = kMaxSeg;
+  }
+  uint32_t local_seg[kMaxSeg];
+  uint32_t n_local = 0;
+  for (uint32_t s = 0; s < nb_seg; ++s) {
+    DXG_QUERYSTATISTICS q;
+    memset(&q, 0, sizeof(q));
+    q.Type = kQsSegment;
+    q.AdapterLuid = luid;
+    q.Query.SegmentId = s;
+    if (QueryStats(&q) != 0) {
+      continue;
+    }
+    if (q.QueryResult.Segment.Aperture == 0) {
+      local_seg[n_local++] = s;
+    }
+  }
+
+  // Enumerate the GPU-using processes: dxgkrnl fills the buffer with vpids.
+  const uint32_t kMaxProcs = 256;
+  uint32_t vpids[kMaxProcs];
+  memset(vpids, 0, sizeof(vpids));
+  uint32_t n_proc = 0;
+  {
+    DXG_ENUMPROCESSES ep;
+    memset(&ep, 0, sizeof(ep));
+    ep.AdapterLuid = luid;
+    ep.pBuffer = reinterpret_cast<uint64_t>(vpids);
+    ep.BufferCount = kMaxProcs;
+    if (EnumProc(&ep) != 0) {
+      ss << __PRETTY_FUNCTION__ << " | D3DKMTEnumProcesses failed";
+      LOG_INFO(ss);
+      // Not fatal: return cleanly with an empty list (no error to the caller).
+      return true;
+    }
+    n_proc = static_cast<uint32_t>(ep.BufferCount);
+    if (n_proc > kMaxProcs) {
+      n_proc = kMaxProcs;
+    }
+  }
+
+  if (n_node > 16) {
+    n_node = 16;
+  }
+
+  for (uint32_t i = 0; i < n_proc; ++i) {
+    const uint32_t pid = vpids[i];
+    DxgProcInfo info;
+    info.pid = pid;
+
+    // Per-process VRAM: sum BytesCommitted over local segments. dxgkrnl returns
+    // a failure (STATUS_INVALID_PARAMETER) for a process holding no GPU
+    // allocations; such segments are simply skipped so we never fabricate a 0.
+    uint64_t vram = 0;
+    bool any_seg = false;
+    for (uint32_t li = 0; li < n_local; ++li) {
+      DXG_QUERYSTATISTICS q;
+      memset(&q, 0, sizeof(q));
+      q.Type = kQsProcessSegment;
+      q.AdapterLuid = luid;
+      q.hProcess = pid;
+      q.Query.SegmentId = local_seg[li];
+      if (QueryStats(&q) != 0) {
+        continue;
+      }
+      any_seg = true;
+      const auto* ps = reinterpret_cast<const QsProcSegmentInfo*>(&q.QueryResult);
+      vram += ps->BytesCommitted;
+    }
+    if (any_seg) {
+      info.vram_bytes = vram;
+      info.vram_valid = true;
+    }
+
+    // Per-process engine time: take the busiest node's cumulative RunningTime
+    // (microseconds) as the process's gfx engine time, converted to ns.
+    int64_t max_us = 0;
+    bool any_node = false;
+    for (uint32_t n = 0; n < n_node; ++n) {
+      DXG_QUERYSTATISTICS q;
+      memset(&q, 0, sizeof(q));
+      q.Type = kQsProcessNode;
+      q.AdapterLuid = luid;
+      q.hProcess = pid;
+      q.Query.NodeId = n;
+      if (QueryStats(&q) != 0) {
+        continue;
+      }
+      any_node = true;
+      const auto* pn = reinterpret_cast<const QsProcNodeInfo*>(&q.QueryResult);
+      if (pn->RunningTime > max_us) {
+        max_us = pn->RunningTime;
+      }
+    }
+    if (any_node) {
+      info.gfx_running_ns = static_cast<uint64_t>(max_us) * 1000ULL;
+      info.gfx_valid = true;
+    }
+
+    // A process that dxgkrnl lists but that holds neither VRAM nor any engine
+    // record is not a real GPU consumer for our purposes; skip it rather than
+    // emit an empty row.
+    if (!info.vram_valid && !info.gfx_valid) {
+      continue;
+    }
+
+    info.name = read_proc_comm(pid);
+    out->push_back(info);
+  }
+
+  ss << __PRETTY_FUNCTION__ << " | enumerated " << n_proc << " dxg process(es), reported "
+     << out->size() << " with GPU usage";
+  LOG_INFO(ss);
+
+  // dlopen handle intentionally leaked (kept resident), matching the policy in
+  // the other DXG helpers above.
+  return true;
 }
 
 }  // namespace amd::smi
